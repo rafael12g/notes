@@ -13,7 +13,7 @@ services:
     depends_on:
       - db
     volumes:
-      - ./take.php:/var/www/html/index.php
+      - ./:/var/www/html
 
   db:
     image: mysql:8.0
