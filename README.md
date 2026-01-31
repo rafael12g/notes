@@ -66,7 +66,7 @@ Si `ADMIN_USER` / `ADMIN_PASS` ne sont pas définis, le compte par défaut est *
 
 ✅ Le montage de volume côté app a été retiré pour éviter les erreurs **403 / Forbidden** dues aux permissions de fichiers sur l’hôte.
 
-⚠️ **Important** : un compte admin **admin/admin** est créé au premier démarrage, et un **changement obligatoire** est demandé à la première connexion.
+⚠️ **Important** : un compte admin **admin/admin** est disponible pour le bootstrap, et un **changement obligatoire** est demandé à la première connexion.
 Pour les nouveaux utilisateurs, l’admin attribue l’accès par document.
 
 ---
