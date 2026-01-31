@@ -7,6 +7,7 @@
        slug VARCHAR(255) DEFAULT NULL,
        type VARCHAR(30) DEFAULT 'note',
        tags VARCHAR(255) DEFAULT '',
+       library_id INT DEFAULT NULL,
        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
    );
@@ -25,8 +26,23 @@
        username VARCHAR(50) UNIQUE NOT NULL,
        password_hash VARCHAR(255) NOT NULL,
        role ENUM('admin','editor','reader') NOT NULL DEFAULT 'editor',
+       must_change_password TINYINT(1) NOT NULL DEFAULT 0,
        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
        last_login TIMESTAMP NULL DEFAULT NULL
+   );
+
+   CREATE TABLE IF NOT EXISTS collab_libraries (
+       id INT AUTO_INCREMENT PRIMARY KEY,
+       name VARCHAR(120) UNIQUE NOT NULL,
+       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   );
+
+   CREATE TABLE IF NOT EXISTS collab_doc_access (
+       user_id INT NOT NULL,
+       doc_id INT NOT NULL,
+       role ENUM('editor','reader') NOT NULL DEFAULT 'reader',
+       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+       PRIMARY KEY (user_id, doc_id)
    );
 ========================================================================= */
 
@@ -91,6 +107,19 @@ function require_role($roles) {
     }
 }
 
+function get_doc_access_role($pdo, $userId, $docId) {
+    $stmt = $pdo->prepare("SELECT role FROM collab_doc_access WHERE user_id = ? AND doc_id = ?");
+    $stmt->execute([$userId, $docId]);
+    return $stmt->fetchColumn() ?: null;
+}
+
+function require_doc_access($pdo, $user, $docId, $needWrite = false) {
+    if ($user['role'] === 'admin') return;
+    $role = get_doc_access_role($pdo, $user['id'], $docId);
+    if (!$role) json_response(['error' => 'Forbidden'], 403);
+    if ($needWrite && $role !== 'editor') json_response(['error' => 'Forbidden'], 403);
+}
+
 // --- CONFIGURATION (ENV READY) ---
 $host = getenv('DB_HOST') ?: 'localhost';
 $db   = getenv('DB_NAME') ?: 'collab_notes';
@@ -110,6 +139,7 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS collab_docs (
     slug VARCHAR(255) DEFAULT NULL,
     type VARCHAR(30) DEFAULT 'note',
     tags VARCHAR(255) DEFAULT '',
+    library_id INT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )");
@@ -128,14 +158,31 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS collab_users (
     username VARCHAR(50) UNIQUE NOT NULL,
     password_hash VARCHAR(255) NOT NULL,
     role ENUM('admin','editor','reader') NOT NULL DEFAULT 'editor',
+    must_change_password TINYINT(1) NOT NULL DEFAULT 0,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     last_login TIMESTAMP NULL DEFAULT NULL
+)");
+
+$pdo->exec("CREATE TABLE IF NOT EXISTS collab_libraries (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(120) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)");
+
+$pdo->exec("CREATE TABLE IF NOT EXISTS collab_doc_access (
+    user_id INT NOT NULL,
+    doc_id INT NOT NULL,
+    role ENUM('editor','reader') NOT NULL DEFAULT 'reader',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, doc_id)
 )");
 
 try { $pdo->exec("ALTER TABLE collab_blocks ADD COLUMN doc_id INT NOT NULL DEFAULT 1"); } catch (PDOException $e) { /* ignore */ }
 try { $pdo->exec("CREATE INDEX idx_blocks_doc_id ON collab_blocks (doc_id)"); } catch (PDOException $e) { /* ignore */ }
 try { $pdo->exec("ALTER TABLE collab_docs ADD COLUMN slug VARCHAR(255) DEFAULT NULL"); } catch (PDOException $e) { /* ignore */ }
 try { $pdo->exec("CREATE UNIQUE INDEX uniq_docs_slug ON collab_docs (slug)"); } catch (PDOException $e) { /* ignore */ }
+try { $pdo->exec("ALTER TABLE collab_docs ADD COLUMN library_id INT DEFAULT NULL"); } catch (PDOException $e) { /* ignore */ }
+try { $pdo->exec("ALTER TABLE collab_users ADD COLUMN must_change_password TINYINT(1) NOT NULL DEFAULT 0"); } catch (PDOException $e) { /* ignore */ }
 
 $bootstrapWarning = false;
 $userCount = $pdo->query("SELECT COUNT(*) FROM collab_users")->fetchColumn();
@@ -146,9 +193,18 @@ if ((int)$userCount === 0) {
         $bootstrapWarning = true;
     }
     $hash = password_hash($adminPass, PASSWORD_DEFAULT);
-    $stmt = $pdo->prepare("INSERT INTO collab_users (username, password_hash, role) VALUES (?, ?, 'admin')");
+    $stmt = $pdo->prepare("INSERT INTO collab_users (username, password_hash, role, must_change_password) VALUES (?, ?, 'admin', 1)");
     $stmt->execute([$adminUser, $hash]);
 }
+
+$defaultLibraryId = $pdo->query("SELECT id FROM collab_libraries ORDER BY id ASC LIMIT 1")->fetchColumn();
+if (!$defaultLibraryId) {
+    $stmt = $pdo->prepare("INSERT INTO collab_libraries (name) VALUES (?)");
+    $stmt->execute(['Général']);
+    $defaultLibraryId = (int)$pdo->lastInsertId();
+}
+$stmt = $pdo->prepare("UPDATE collab_docs SET library_id = ? WHERE library_id IS NULL OR library_id = 0");
+$stmt->execute([$defaultLibraryId]);
 
 if (empty($_SESSION['csrf_token'])) {
     $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
@@ -234,7 +290,7 @@ if ($action === 'login') {
         } else {
             $username = trim($payload['username'] ?? '');
             $password = $payload['password'] ?? '';
-            $stmt = $pdo->prepare("SELECT id, username, password_hash, role FROM collab_users WHERE username = ?");
+            $stmt = $pdo->prepare("SELECT id, username, password_hash, role, must_change_password FROM collab_users WHERE username = ?");
             $stmt->execute([$username]);
             $userRow = $stmt->fetch(PDO::FETCH_ASSOC);
             if ($userRow && password_verify($password, $userRow['password_hash'])) {
@@ -242,7 +298,8 @@ if ($action === 'login') {
                 $_SESSION['user'] = [
                     'id' => (int)$userRow['id'],
                     'username' => $userRow['username'],
-                    'role' => $userRow['role']
+                    'role' => $userRow['role'],
+                    'must_change' => (int)($userRow['must_change_password'] ?? 0)
                 ];
                 $pdo->prepare("UPDATE collab_users SET last_login = CURRENT_TIMESTAMP WHERE id = ?")->execute([$userRow['id']]);
 
@@ -268,7 +325,18 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
     }
 
     if ($action === 'docs_list') {
-        $stmt = $pdo->query("SELECT id, title, slug, type, tags, created_at, updated_at FROM collab_docs ORDER BY updated_at DESC, id DESC");
+        $user = $_SESSION['user'];
+        if ($user['role'] === 'admin') {
+            $stmt = $pdo->query("SELECT id, title, slug, type, tags, library_id, created_at, updated_at FROM collab_docs ORDER BY updated_at DESC, id DESC");
+            $docs = $stmt->fetchAll(PDO::FETCH_ASSOC);
+            foreach ($docs as &$d) { $d['access_role'] = 'editor'; }
+            json_response($docs);
+        }
+        $stmt = $pdo->prepare("SELECT d.id, d.title, d.slug, d.type, d.tags, d.library_id, d.created_at, d.updated_at, da.role AS access_role
+            FROM collab_docs d
+            INNER JOIN collab_doc_access da ON da.doc_id = d.id AND da.user_id = ?
+            ORDER BY d.updated_at DESC, d.id DESC");
+        $stmt->execute([$user['id']]);
         json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
     }
 
@@ -278,11 +346,17 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
         $type = $input['type'] ?? 'note';
         $tags = trim($input['tags'] ?? '');
         $template = $input['template'] ?? $type;
+        $libraryId = (int)($input['library_id'] ?? $defaultLibraryId);
         $slug = ensure_unique_slug($pdo, slugify($title));
 
-        $stmt = $pdo->prepare("INSERT INTO collab_docs (title, slug, type, tags) VALUES (?, ?, ?, ?)");
-        $stmt->execute([$title, $slug, $type, $tags]);
+        $stmt = $pdo->prepare("INSERT INTO collab_docs (title, slug, type, tags, library_id) VALUES (?, ?, ?, ?, ?)");
+        $stmt->execute([$title, $slug, $type, $tags, $libraryId]);
         $docId = (int)$pdo->lastInsertId();
+
+        if ($_SESSION['user']['role'] !== 'admin') {
+            $stmt = $pdo->prepare("INSERT INTO collab_doc_access (user_id, doc_id, role) VALUES (?, ?, 'editor')");
+            $stmt->execute([$_SESSION['user']['id'], $docId]);
+        }
 
         $blocks = templateBlocks($template, $title);
         foreach ($blocks as $index => $content) {
@@ -296,12 +370,14 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
     if ($action === 'docs_update') {
         require_role(['admin', 'editor']);
         $docId = (int)($input['id'] ?? 0);
+        require_doc_access($pdo, $_SESSION['user'], $docId, true);
         $title = trim($input['title'] ?? '');
         $type = $input['type'] ?? 'note';
         $tags = trim($input['tags'] ?? '');
+        $libraryId = (int)($input['library_id'] ?? $defaultLibraryId);
         if ($title === '') { json_response(['error' => 'Titre requis'], 422); }
-        $stmt = $pdo->prepare("UPDATE collab_docs SET title = ?, type = ?, tags = ? WHERE id = ?");
-        $stmt->execute([$title, $type, $tags, $docId]);
+        $stmt = $pdo->prepare("UPDATE collab_docs SET title = ?, type = ?, tags = ?, library_id = ? WHERE id = ?");
+        $stmt->execute([$title, $type, $tags, $libraryId, $docId]);
         json_response(["status" => "updated"]);
     }
 
@@ -310,6 +386,8 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
         $docId = (int)($input['id'] ?? 0);
         $stmt = $pdo->prepare("DELETE FROM collab_blocks WHERE doc_id = ?");
         $stmt->execute([$docId]);
+        $stmt = $pdo->prepare("DELETE FROM collab_doc_access WHERE doc_id = ?");
+        $stmt->execute([$docId]);
         $stmt = $pdo->prepare("DELETE FROM collab_docs WHERE id = ?");
         $stmt->execute([$docId]);
         json_response(["status" => "deleted"]);
@@ -317,6 +395,7 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
 
     if ($action === 'fetch') {
         $docId = (int)($input['doc_id'] ?? $defaultDocId);
+        require_doc_access($pdo, $_SESSION['user'], $docId, false);
         $stmt = $pdo->prepare("SELECT * FROM collab_blocks WHERE doc_id = ? ORDER BY position ASC");
         $stmt->execute([$docId]);
         json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
@@ -325,6 +404,7 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
     if ($action === 'add') {
         require_role(['admin', 'editor']);
         $docId = (int)($input['doc_id'] ?? $defaultDocId);
+        require_doc_access($pdo, $_SESSION['user'], $docId, true);
         $maxStmt = $pdo->prepare("SELECT MAX(position) FROM collab_blocks WHERE doc_id = ?");
         $maxStmt->execute([$docId]);
         $max = $maxStmt->fetchColumn();
@@ -347,6 +427,7 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
     if ($action === 'update') {
         require_role(['admin', 'editor']);
         $docId = (int)($input['doc_id'] ?? $defaultDocId);
+        require_doc_access($pdo, $_SESSION['user'], $docId, true);
         $stmt = $pdo->prepare("UPDATE collab_blocks SET content = ? WHERE id = ?");
         $stmt->execute([$input['content'], $input['id']]);
         $pdo->prepare("UPDATE collab_docs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")->execute([$docId]);
@@ -356,6 +437,7 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
     if ($action === 'reorder') {
         require_role(['admin', 'editor']);
         $docId = (int)($input['doc_id'] ?? $defaultDocId);
+        require_doc_access($pdo, $_SESSION['user'], $docId, true);
         foreach ($input['order'] as $index => $id) {
             $stmt = $pdo->prepare("UPDATE collab_blocks SET position = ? WHERE id = ? AND doc_id = ?");
             $stmt->execute([$index, $id, $docId]);
@@ -367,6 +449,7 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
     if ($action === 'delete') {
         require_role(['admin', 'editor']);
         $docId = (int)($input['doc_id'] ?? $defaultDocId);
+        require_doc_access($pdo, $_SESSION['user'], $docId, true);
         $stmt = $pdo->prepare("DELETE FROM collab_blocks WHERE id = ? AND doc_id = ?");
         $stmt->execute([$input['id'], $docId]);
         $pdo->prepare("UPDATE collab_docs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")->execute([$docId]);
@@ -375,6 +458,7 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
 
     if ($action === 'backlinks') {
         $docId = (int)($input['doc_id'] ?? $defaultDocId);
+        require_doc_access($pdo, $_SESSION['user'], $docId, false);
         $stmt = $pdo->prepare("SELECT id, title, slug FROM collab_docs WHERE id = ?");
         $stmt->execute([$docId]);
         $doc = $stmt->fetch(PDO::FETCH_ASSOC);
@@ -382,13 +466,25 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
         $title = esc_like($doc['title']);
         $slug = esc_like($doc['slug']);
 
+        if ($_SESSION['user']['role'] === 'admin') {
+            $stmt = $pdo->prepare("SELECT DISTINCT d.id, d.title, d.slug
+                FROM collab_docs d
+                INNER JOIN collab_blocks b ON b.doc_id = d.id
+                WHERE d.id <> ? AND (b.content LIKE ? OR b.content LIKE ?)
+                ORDER BY d.updated_at DESC
+            ");
+            $stmt->execute([$docId, "%[[{$title}]]%", "%[[{$slug}]]%"]);
+            json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
+        }
+
         $stmt = $pdo->prepare("SELECT DISTINCT d.id, d.title, d.slug
             FROM collab_docs d
             INNER JOIN collab_blocks b ON b.doc_id = d.id
+            INNER JOIN collab_doc_access da ON da.doc_id = d.id AND da.user_id = ?
             WHERE d.id <> ? AND (b.content LIKE ? OR b.content LIKE ?)
             ORDER BY d.updated_at DESC
         ");
-        $stmt->execute([$docId, "%[[{$title}]]%", "%[[{$slug}]]%"]);
+        $stmt->execute([$_SESSION['user']['id'], $docId, "%[[{$title}]]%", "%[[{$slug}]]%"]);
         json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
     }
 
@@ -470,6 +566,92 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
         json_response(['status' => 'deleted']);
     }
 
+    if ($action === 'libraries_list') {
+        $stmt = $pdo->query("SELECT id, name FROM collab_libraries ORDER BY name ASC");
+        json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
+    }
+
+    if ($action === 'libraries_create') {
+        require_role(['admin']);
+        $name = trim($input['name'] ?? '');
+        if ($name === '') json_response(['error' => 'Nom requis'], 422);
+        try {
+            $stmt = $pdo->prepare("INSERT INTO collab_libraries (name) VALUES (?)");
+            $stmt->execute([$name]);
+        } catch (PDOException $e) {
+            json_response(['error' => 'Bibliothèque déjà existante'], 409);
+        }
+        json_response(['status' => 'created']);
+    }
+
+    if ($action === 'libraries_delete') {
+        require_role(['admin']);
+        $libraryId = (int)($input['id'] ?? 0);
+        if ($libraryId === (int)$defaultLibraryId) {
+            json_response(['error' => 'Impossible de supprimer la bibliothèque par défaut'], 409);
+        }
+        $stmt = $pdo->prepare("UPDATE collab_docs SET library_id = ? WHERE library_id = ?");
+        $stmt->execute([$defaultLibraryId, $libraryId]);
+        $stmt = $pdo->prepare("DELETE FROM collab_libraries WHERE id = ?");
+        $stmt->execute([$libraryId]);
+        json_response(['status' => 'deleted']);
+    }
+
+    if ($action === 'doc_access_list') {
+        require_role(['admin']);
+        $docId = (int)($input['doc_id'] ?? 0);
+        $stmt = $pdo->prepare("SELECT u.id, u.username, u.role AS global_role, da.role AS doc_role
+            FROM collab_users u
+            LEFT JOIN collab_doc_access da ON da.user_id = u.id AND da.doc_id = ?
+            ORDER BY u.username ASC");
+        $stmt->execute([$docId]);
+        json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
+    }
+
+    if ($action === 'doc_access_update') {
+        require_role(['admin']);
+        $docId = (int)($input['doc_id'] ?? 0);
+        $userId = (int)($input['user_id'] ?? 0);
+        $role = $input['role'] ?? 'none';
+        if (!in_array($role, ['editor', 'reader', 'none'], true)) {
+            json_response(['error' => 'Rôle invalide'], 422);
+        }
+        if ($role === 'none') {
+            $stmt = $pdo->prepare("DELETE FROM collab_doc_access WHERE user_id = ? AND doc_id = ?");
+            $stmt->execute([$userId, $docId]);
+            json_response(['status' => 'deleted']);
+        }
+        $stmt = $pdo->prepare("INSERT INTO collab_doc_access (user_id, doc_id, role) VALUES (?, ?, ?)
+            ON DUPLICATE KEY UPDATE role = VALUES(role)");
+        $stmt->execute([$userId, $docId, $role]);
+        json_response(['status' => 'updated']);
+    }
+
+    if ($action === 'change_credentials') {
+        require_auth();
+        $currentPassword = $input['current_password'] ?? '';
+        $newPassword = $input['new_password'] ?? '';
+        $newUsername = trim($input['new_username'] ?? '');
+        if (strlen($newPassword) < 8) json_response(['error' => 'Mot de passe trop court'], 422);
+        if (strlen($newUsername) < 3) json_response(['error' => 'Nom d’utilisateur trop court'], 422);
+
+        $stmt = $pdo->prepare("SELECT password_hash FROM collab_users WHERE id = ?");
+        $stmt->execute([$_SESSION['user']['id']]);
+        $hash = $stmt->fetchColumn();
+        if (!$hash || !password_verify($currentPassword, $hash)) {
+            json_response(['error' => 'Mot de passe actuel invalide'], 401);
+        }
+        try {
+            $stmt = $pdo->prepare("UPDATE collab_users SET username = ?, password_hash = ?, must_change_password = 0 WHERE id = ?");
+            $stmt->execute([$newUsername, password_hash($newPassword, PASSWORD_DEFAULT), $_SESSION['user']['id']]);
+        } catch (PDOException $e) {
+            json_response(['error' => 'Nom d’utilisateur déjà utilisé'], 409);
+        }
+        $_SESSION['user']['username'] = $newUsername;
+        $_SESSION['user']['must_change'] = 0;
+        json_response(['status' => 'updated']);
+    }
+
     if ($action === 'change_password') {
         require_auth();
         $currentPassword = $input['current_password'] ?? '';
@@ -485,6 +667,7 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
         $newHash = password_hash($newPassword, PASSWORD_DEFAULT);
         $stmt = $pdo->prepare("UPDATE collab_users SET password_hash = ? WHERE id = ?");
         $stmt->execute([$newHash, $_SESSION['user']['id']]);
+        $_SESSION['user']['must_change'] = 0;
         json_response(['status' => 'updated']);
     }
 
@@ -697,6 +880,14 @@ if (!$currentUser) {
         <div id="doc-list"></div>
 
         <div class="sidebar-section">
+            <div class="sidebar-title">Bibliothèques</div>
+            <div id="library-list" class="link-list"></div>
+            <?php if ($currentUser['role'] === 'admin') { ?>
+                <button class="btn-secondary" id="btn-libraries">Gérer les bibliothèques</button>
+            <?php } ?>
+        </div>
+
+        <div class="sidebar-section">
             <div class="sidebar-title">Liens wiki</div>
             <div id="out-links" class="link-list"></div>
         </div>
@@ -733,9 +924,13 @@ if (!$currentUser) {
                     <option value="course">Cours</option>
                     <option value="spec">Cahier des charges</option>
                 </select>
+                <select id="doc-library" class="doc-type-select"></select>
                 <input type="text" id="doc-tags" class="doc-tags" placeholder="Tags (ex: produit, sprint)">
             </div>
             <div style="display:flex; align-items:center; gap:10px;">
+                <?php if ($currentUser['role'] === 'admin') { ?>
+                    <button class="btn-secondary" id="btn-access">Accès</button>
+                <?php } ?>
                 <div class="doc-slug" id="doc-slug">slug</div>
                 <div class="status" id="doc-status">Prêt</div>
             </div>
@@ -769,6 +964,7 @@ if (!$currentUser) {
             <option value="spec">Cahier des charges</option>
         </select>
         <input type="text" id="new-tags" placeholder="Tags (optionnel)">
+        <select id="new-library"></select>
         <select id="new-template">
             <option value="note">Modèle : Note</option>
             <option value="wiki">Modèle : Wiki</option>
@@ -790,6 +986,46 @@ if (!$currentUser) {
         <div class="modal-actions">
             <button class="btn-ghost" id="btn-account-cancel">Annuler</button>
             <button class="btn-primary" id="btn-account-save">Mettre à jour</button>
+        </div>
+    </div>
+</div>
+
+<?php if ($currentUser['role'] === 'admin') { ?>
+<div class="modal" id="access-modal">
+    <div class="modal-card large">
+        <h3>Accès au document</h3>
+        <div id="access-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+        <div class="modal-actions">
+            <button class="btn-ghost" id="btn-access-close">Fermer</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="libraries-modal">
+    <div class="modal-card large">
+        <h3>Bibliothèques</h3>
+        <div id="libraries-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+        <div style="border-top:1px solid #e5e7eb; padding-top:12px; display:flex; flex-direction:column; gap:10px;">
+            <strong>Ajouter une bibliothèque</strong>
+            <input type="text" id="new-library-name" placeholder="Nom">
+            <button class="btn-primary" id="btn-library-create">Créer</button>
+        </div>
+        <div class="modal-actions">
+            <button class="btn-ghost" id="btn-libraries-close">Fermer</button>
+        </div>
+    </div>
+</div>
+<?php } ?>
+
+<div class="modal" id="force-credentials-modal">
+    <div class="modal-card">
+        <h3>Changement obligatoire</h3>
+        <div style="font-size:12px;color:#6b7280;">Veuillez modifier votre identifiant et votre mot de passe.</div>
+        <input type="text" id="force-username" placeholder="Nouveau nom d'utilisateur">
+        <input type="password" id="force-current" placeholder="Mot de passe actuel">
+        <input type="password" id="force-password" placeholder="Nouveau mot de passe (min 8)">
+        <div class="modal-actions">
+            <button class="btn-primary" id="btn-force-save">Mettre à jour</button>
         </div>
     </div>
 </div>
@@ -823,26 +1059,34 @@ if (!$currentUser) {
     const csrfToken = "<?php echo htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>";
     const userRole = "<?php echo htmlspecialchars($currentUser['role'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>";
     const userName = "<?php echo htmlspecialchars($currentUser['username'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>";
+    const mustChange = <?php echo !empty($currentUser['must_change']) ? 'true' : 'false'; ?>;
     const isAdmin = userRole === 'admin';
-    const isEditor = userRole === 'admin' || userRole === 'editor';
+    const canCreate = isAdmin || userRole === 'editor';
+    let canEdit = isAdmin;
 
     const container = document.getElementById('viewport');
     const docList = document.getElementById('doc-list');
     const docTitle = document.getElementById('doc-title');
     const docType = document.getElementById('doc-type');
+    const docLibrary = document.getElementById('doc-library');
     const docTags = document.getElementById('doc-tags');
     const docSlug = document.getElementById('doc-slug');
     const docStatus = document.getElementById('doc-status');
     const docSearch = document.getElementById('doc-search');
     const outLinks = document.getElementById('out-links');
     const backLinks = document.getElementById('back-links');
+    const libraryList = document.getElementById('library-list');
+    const newLibrarySelect = document.getElementById('new-library');
 
     let activeBlockId = null;
     let saveTimer = {};
     let docSaveTimer = null;
     let lastFocusedCell = null;
     let currentDocId = null;
+    let currentDocRole = null;
+    let currentLibraryId = null;
     let docs = [];
+    let libraries = [];
 
     function setStatus(text) {
         document.getElementById('status').innerText = text;
@@ -866,13 +1110,21 @@ if (!$currentUser) {
     function addItem(type) { addBlock(type); toggleMenu(); }
 
     function applyRoleUI() {
-        if (!isEditor) {
+        if (!canEdit) {
             document.getElementById('btn-plus').style.display = 'none';
             document.getElementById('menu').style.display = 'none';
-            document.getElementById('btn-new-doc').style.display = 'none';
+            if (!canCreate) document.getElementById('btn-new-doc').style.display = 'none';
             docTitle.setAttribute('readonly', 'readonly');
             docTags.setAttribute('readonly', 'readonly');
             docType.setAttribute('disabled', 'disabled');
+            docLibrary.setAttribute('disabled', 'disabled');
+        } else {
+            document.getElementById('btn-plus').style.display = '';
+            if (canCreate) document.getElementById('btn-new-doc').style.display = '';
+            docTitle.removeAttribute('readonly');
+            docTags.removeAttribute('readonly');
+            docType.removeAttribute('disabled');
+            docLibrary.removeAttribute('disabled');
         }
     }
 
@@ -886,11 +1138,53 @@ if (!$currentUser) {
         if (currentDocId) selectDoc(currentDocId, true);
     }
 
+    async function loadLibraries() {
+        const res = await api('libraries_list');
+        libraries = await res.json();
+        renderLibraries();
+        fillLibrarySelects();
+        if (!currentLibraryId && libraries.length) currentLibraryId = libraries[0].id;
+    }
+
+    function renderLibraries() {
+        libraryList.innerHTML = '';
+        const allItem = document.createElement('div');
+        allItem.className = 'link-item';
+        allItem.textContent = 'Toutes';
+        allItem.onclick = () => { currentLibraryId = null; renderDocList(); };
+        libraryList.appendChild(allItem);
+
+        libraries.forEach(lib => {
+            const el = document.createElement('div');
+            el.className = 'link-item';
+            el.textContent = lib.name;
+            el.onclick = () => { currentLibraryId = lib.id; renderDocList(); };
+            libraryList.appendChild(el);
+        });
+    }
+
+    function fillLibrarySelects() {
+        const selects = [docLibrary, newLibrarySelect];
+        selects.forEach(sel => { sel.innerHTML = ''; });
+        libraries.forEach(lib => {
+            selects.forEach(sel => {
+                const opt = document.createElement('option');
+                opt.value = lib.id;
+                opt.textContent = lib.name;
+                sel.appendChild(opt);
+            });
+        });
+    }
+
     function renderDocList() {
         const filter = docSearch.value.toLowerCase();
         docList.innerHTML = '';
         docs
-            .filter(d => d.title.toLowerCase().includes(filter) || (d.tags || '').toLowerCase().includes(filter) || (d.slug || '').toLowerCase().includes(filter))
+            .filter(d => {
+                const matchesText = d.title.toLowerCase().includes(filter) || (d.tags || '').toLowerCase().includes(filter) || (d.slug || '').toLowerCase().includes(filter);
+                const matchesLibrary = currentLibraryId ? String(d.library_id) === String(currentLibraryId) : true;
+                return matchesText && matchesLibrary;
+            })
             .forEach(doc => {
                 const item = document.createElement('div');
                 item.className = 'doc-item' + (String(doc.id) === String(currentDocId) ? ' active' : '');
@@ -925,7 +1219,12 @@ if (!$currentUser) {
         docTitle.value = doc.title;
         docType.value = doc.type;
         docTags.value = doc.tags || '';
+        docLibrary.value = doc.library_id || '';
         docSlug.innerText = doc.slug ? `slug: ${doc.slug}` : 'slug: -';
+        currentDocRole = doc.access_role || (isAdmin ? 'editor' : 'reader');
+        canEdit = isAdmin || currentDocRole === 'editor';
+        applyRoleUI();
+        if (sortableInstance) sortableInstance.option('disabled', !canEdit);
         renderDocList();
         if (!skipRefresh) container.innerHTML = '';
         refresh();
@@ -939,6 +1238,7 @@ if (!$currentUser) {
         document.getElementById('new-title').value = '';
         document.getElementById('new-type').value = 'wiki';
         document.getElementById('new-tags').value = '';
+        if (currentLibraryId) document.getElementById('new-library').value = currentLibraryId;
         document.getElementById('new-template').value = 'wiki';
         openModal();
     };
@@ -948,7 +1248,8 @@ if (!$currentUser) {
         const type = document.getElementById('new-type').value;
         const tags = document.getElementById('new-tags').value;
         const template = document.getElementById('new-template').value;
-        const res = await api('docs_create', { title, type, tags, template });
+        const library_id = document.getElementById('new-library').value;
+        const res = await api('docs_create', { title, type, tags, template, library_id });
         const data = await res.json();
         closeModal();
         await loadDocs();
@@ -973,6 +1274,19 @@ if (!$currentUser) {
         document.getElementById('new-password').value = '';
     };
 
+    // Forced credentials change
+    document.getElementById('btn-force-save').onclick = async () => {
+        const new_username = document.getElementById('force-username').value.trim();
+        const current_password = document.getElementById('force-current').value;
+        const new_password = document.getElementById('force-password').value;
+        const res = await api('change_credentials', { new_username, current_password, new_password });
+        const data = await res.json();
+        if (data.error) { alert(data.error); return; }
+        alert('Identifiants mis à jour.');
+        document.getElementById('force-credentials-modal').classList.remove('show');
+        location.reload();
+    };
+
     // Users modal (admin)
     const usersModal = document.getElementById('users-modal');
     const usersList = document.getElementById('users-list');
@@ -993,6 +1307,96 @@ if (!$currentUser) {
             document.getElementById('new-user-pass').value = '';
             await loadUsers();
         };
+    }
+
+    // Access modal (admin)
+    const accessModal = document.getElementById('access-modal');
+    const accessList = document.getElementById('access-list');
+    if (isAdmin) {
+        document.getElementById('btn-access').onclick = async () => {
+            accessModal.classList.add('show');
+            await loadDocAccess();
+        };
+        document.getElementById('btn-access-close').onclick = () => accessModal.classList.remove('show');
+    }
+
+    async function loadDocAccess() {
+        if (!isAdmin || !currentDocId) return;
+        const res = await api('doc_access_list', { doc_id: currentDocId });
+        const data = await res.json();
+        accessList.innerHTML = '';
+        data.forEach(user => {
+            const row = document.createElement('div');
+            row.style.display = 'grid';
+            row.style.gridTemplateColumns = '1fr 120px 90px';
+            row.style.gap = '8px';
+            row.style.alignItems = 'center';
+            row.innerHTML = `
+                <div><strong>${user.username}</strong><div style="font-size:11px;color:#6b7280;">${user.global_role}</div></div>
+                <select class="doc-access">
+                    <option value="none" ${!user.doc_role ? 'selected' : ''}>Aucun</option>
+                    <option value="reader" ${user.doc_role === 'reader' ? 'selected' : ''}>Lecteur</option>
+                    <option value="editor" ${user.doc_role === 'editor' ? 'selected' : ''}>Éditeur</option>
+                </select>
+                <button class="btn-secondary btn-save">Sauver</button>
+            `;
+            row.querySelector('.btn-save').onclick = async () => {
+                const role = row.querySelector('.doc-access').value;
+                const res = await api('doc_access_update', { doc_id: currentDocId, user_id: user.id, role });
+                const resp = await res.json();
+                if (resp.error) { alert(resp.error); return; }
+                await loadDocAccess();
+                await loadDocs();
+            };
+            accessList.appendChild(row);
+        });
+    }
+
+    // Libraries modal (admin)
+    const librariesModal = document.getElementById('libraries-modal');
+    const librariesList = document.getElementById('libraries-list');
+    if (isAdmin) {
+        document.getElementById('btn-libraries').onclick = async () => {
+            librariesModal.classList.add('show');
+            await loadLibrariesAdmin();
+        };
+        document.getElementById('btn-libraries-close').onclick = () => librariesModal.classList.remove('show');
+        document.getElementById('btn-library-create').onclick = async () => {
+            const name = document.getElementById('new-library-name').value.trim();
+            const res = await api('libraries_create', { name });
+            const data = await res.json();
+            if (data.error) { alert(data.error); return; }
+            document.getElementById('new-library-name').value = '';
+            await loadLibraries();
+            await loadLibrariesAdmin();
+        };
+    }
+
+    async function loadLibrariesAdmin() {
+        if (!isAdmin) return;
+        const res = await api('libraries_list');
+        const libs = await res.json();
+        librariesList.innerHTML = '';
+        libs.forEach(lib => {
+            const row = document.createElement('div');
+            row.style.display = 'grid';
+            row.style.gridTemplateColumns = '1fr 90px';
+            row.style.gap = '8px';
+            row.style.alignItems = 'center';
+            row.innerHTML = `
+                <div><strong>${lib.name}</strong></div>
+                <button class="btn-secondary btn-delete">Suppr</button>
+            `;
+            row.querySelector('.btn-delete').onclick = async () => {
+                if (!confirm('Supprimer cette bibliothèque ?')) return;
+                const res = await api('libraries_delete', { id: lib.id });
+                const data = await res.json();
+                if (data.error) { alert(data.error); return; }
+                await loadLibraries();
+                await loadLibrariesAdmin();
+            };
+            librariesList.appendChild(row);
+        });
     }
 
     async function loadUsers() {
@@ -1038,30 +1442,32 @@ if (!$currentUser) {
 
     function scheduleDocMetaSave() {
         clearTimeout(docSaveTimer);
-        if (!isEditor) return;
+        if (!canEdit) return;
         docSaveTimer = setTimeout(async () => {
-            await api('docs_update', { id: currentDocId, title: docTitle.value, type: docType.value, tags: docTags.value });
+            await api('docs_update', { id: currentDocId, title: docTitle.value, type: docType.value, tags: docTags.value, library_id: docLibrary.value });
             await loadDocs();
         }, 600);
     }
     docTitle.oninput = scheduleDocMetaSave;
     docType.onchange = scheduleDocMetaSave;
     docTags.oninput = scheduleDocMetaSave;
+    docLibrary.onchange = scheduleDocMetaSave;
 
     let sortableInstance = null;
     document.addEventListener('DOMContentLoaded', () => {
         applyRoleUI();
+        loadLibraries();
         loadDocs();
         setInterval(refresh, 2500);
         sortableInstance = new Sortable(container, {
             animation: 150, handle: '.drag-handle',
             onEnd: () => {
-                if (!isEditor) return;
+                if (!canEdit) return;
                 const order = Array.from(container.children).map(el => el.dataset.id);
                 api('reorder', { order, doc_id: currentDocId });
             }
         });
-        sortableInstance.option('disabled', !isEditor);
+        sortableInstance.option('disabled', !canEdit);
 
         document.getElementById('img-up').addEventListener('change', function() {
             if (this.files[0]) {
@@ -1070,6 +1476,10 @@ if (!$currentUser) {
                 reader.readAsDataURL(this.files[0]);
             }
         });
+
+        if (mustChange) {
+            document.getElementById('force-credentials-modal').classList.add('show');
+        }
     });
 
     async function refresh() {
@@ -1077,7 +1487,7 @@ if (!$currentUser) {
         try {
             const res = await api('fetch', { doc_id: currentDocId });
             const blocks = await res.json();
-            if (blocks.length === 0 && container.children.length === 0) { if (isEditor) addBlock('text'); return; }
+            if (blocks.length === 0 && container.children.length === 0) { if (canEdit) addBlock('text'); return; }
             blocks.forEach(block => {
                 let el = document.getElementById(`blk-${block.id}`);
                 if (!el) renderBlock(block);
@@ -1150,7 +1560,7 @@ if (!$currentUser) {
             selectDoc(link.doc.id);
             return;
         }
-        if (!isEditor) {
+        if (!canEdit) {
             alert('Lien introuvable. Demandez à un éditeur de créer la page.');
             return;
         }
@@ -1162,14 +1572,14 @@ if (!$currentUser) {
     }
 
     async function addBlock(type, content = null) {
-        if (!currentDocId || !isEditor) return;
+        if (!currentDocId || !canEdit) return;
         await api('add', { type, content, doc_id: currentDocId });
         refresh();
         setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 100);
     }
 
     async function save(id, content) {
-        if (!isEditor) return;
+        if (!canEdit) return;
         setStatus('Sauvegarde...');
         clearTimeout(saveTimer[id]);
         saveTimer[id] = setTimeout(async () => {
@@ -1192,7 +1602,7 @@ if (!$currentUser) {
             <div class="block-content"></div>
         `;
         const contentDiv = div.querySelector('.block-content');
-        if (!isEditor) {
+        if (!canEdit) {
             div.querySelector('.block-controls').style.display = 'none';
         }
         container.appendChild(div);
@@ -1210,7 +1620,7 @@ if (!$currentUser) {
             quill.root.innerHTML = block.content || '';
             quill.on('selection-change', r => activeBlockId = r ? block.id : null);
             quill.on('text-change', (d,o,s) => { if (s === 'user') save(block.id, quill.root.innerHTML); });
-            if (!isEditor) quill.enable(false);
+            if (!canEdit) quill.enable(false);
         }
         else if (block.type === 'table') {
             const toolbar = document.createElement('div');
@@ -1224,7 +1634,7 @@ if (!$currentUser) {
                 <button class="tbl-btn" onclick="tblAdd(${block.id}, 'col')">+ Col</button>
             `;
             div.appendChild(toolbar);
-            if (!isEditor) toolbar.style.display = 'none';
+            if (!canEdit) toolbar.style.display = 'none';
             contentDiv.innerHTML = `<div class="table-container"><table class="native-table"><tbody></tbody></table></div>`;
 
             div.tableData = JSON.parse(block.content);
@@ -1237,7 +1647,7 @@ if (!$currentUser) {
             const inp = contentDiv.querySelector('.todo-input');
             const doSave = () => { save(block.id, JSON.stringify({text: inp.value, checked: chk.checked})); inp.classList.toggle('todo-done', chk.checked); };
             chk.onchange = doSave; inp.oninput = doSave; inp.onfocus = () => activeBlockId = block.id; inp.onblur = () => activeBlockId = null;
-            if (!isEditor) { chk.disabled = true; inp.readOnly = true; }
+            if (!canEdit) { chk.disabled = true; inp.readOnly = true; }
         }
         else if (block.type === 'image') { contentDiv.className = 'img-block'; contentDiv.innerHTML = `<img src="${block.content}">`; }
         else if (block.type === 'youtube') {
@@ -1256,9 +1666,9 @@ if (!$currentUser) {
             const tr = document.createElement('tr');
             row.forEach((cellHTML, cI) => {
                 const td = document.createElement('td');
-                td.contentEditable = isEditor ? 'true' : 'false';
+                td.contentEditable = canEdit ? 'true' : 'false';
                 td.innerHTML = cellHTML;
-                if (isEditor) {
+                if (canEdit) {
                     td.onfocus = () => { activeBlockId = id; lastFocusedCell = td; };
                     td.onblur = () => { activeBlockId = null; };
                     td.oninput = () => {
@@ -1273,7 +1683,7 @@ if (!$currentUser) {
     }
 
     window.tblAdd = (id, type) => {
-        if (!isEditor) return;
+        if (!canEdit) return;
         const el = document.getElementById(`blk-${id}`);
         if (type === 'row') el.tableData.push(new Array(el.tableData[0].length).fill(''));
         else el.tableData.forEach(row => row.push(''));
@@ -1282,7 +1692,7 @@ if (!$currentUser) {
     };
 
     window.tblColor = (id, color, type) => {
-        if (!isEditor) return;
+        if (!canEdit) return;
         if (!lastFocusedCell) return;
         if (type === 'fore') lastFocusedCell.style.color = color;
         else lastFocusedCell.style.backgroundColor = color;
@@ -1290,7 +1700,7 @@ if (!$currentUser) {
     };
 
     window.tblCmd = (id, cmd) => {
-        if (!isEditor) return;
+        if (!canEdit) return;
         if (!lastFocusedCell) return;
         if (cmd === 'bold') lastFocusedCell.style.fontWeight = lastFocusedCell.style.fontWeight === 'bold' ? 'normal' : 'bold';
         lastFocusedCell.dispatchEvent(new Event('input'));
@@ -1313,7 +1723,7 @@ if (!$currentUser) {
     }
 
     async function deleteBlock(id) {
-        if (!isEditor) return;
+        if (!canEdit) return;
         if (!confirm('Supprimer ?')) return;
         document.getElementById(`blk-${id}`).remove();
         await api('delete', { id, doc_id: currentDocId });

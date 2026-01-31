@@ -11,7 +11,7 @@ services:
       DB_USER: collab_user
       DB_PASS: collab_pass
       ADMIN_USER: admin
-      ADMIN_PASS: change-me-now
+      ADMIN_PASS: admin
     depends_on:
       - db
 

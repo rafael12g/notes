@@ -13,6 +13,7 @@
 - **Sauvegarde auto** + synchronisation **semi‑temps réel** (polling).
 - **Authentification + rôles** : admin / éditeur / lecteur.
 - **Liens wiki + backlinks** : navigation entre pages via `[[Titre]]`.
+- **Bibliothèques** : organisation des documents par collections.
 - **Docker prêt** (image Apache + PHP + MySQL).
 
 ---
@@ -65,7 +66,8 @@ Si `ADMIN_USER` / `ADMIN_PASS` ne sont pas définis, le compte par défaut est *
 
 ✅ Le montage de volume côté app a été retiré pour éviter les erreurs **403 / Forbidden** dues aux permissions de fichiers sur l’hôte.
 
-⚠️ **Important** : définissez `ADMIN_USER` et `ADMIN_PASS` pour sécuriser le premier compte admin.
+⚠️ **Important** : un compte admin **admin/admin** est créé au premier démarrage, et un **changement obligatoire** est demandé à la première connexion.
+Pour les nouveaux utilisateurs, l’admin attribue l’accès par document.
 
 ---
 
@@ -86,6 +88,7 @@ CREATE TABLE IF NOT EXISTS collab_docs (
     title VARCHAR(255) NOT NULL,
     type VARCHAR(30) DEFAULT 'note',
     tags VARCHAR(255) DEFAULT '',
+    library_id INT DEFAULT NULL,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 );
@@ -97,6 +100,30 @@ CREATE TABLE IF NOT EXISTS collab_blocks (
     content LONGTEXT,
     position INT DEFAULT 0,
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS collab_users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role ENUM('admin','editor','reader') NOT NULL DEFAULT 'editor',
+    must_change_password TINYINT(1) NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login TIMESTAMP NULL DEFAULT NULL
+);
+
+CREATE TABLE IF NOT EXISTS collab_libraries (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(120) UNIQUE NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS collab_doc_access (
+    user_id INT NOT NULL,
+    doc_id INT NOT NULL,
+    role ENUM('editor','reader') NOT NULL DEFAULT 'reader',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (user_id, doc_id)
 );
 ```
 
@@ -127,6 +154,9 @@ Ouvrir l’URL de votre site.
 6. **Liens wiki** : écrire `[[Titre d'une page]]` pour créer un lien
     - Les **liens sortants** et **backlinks** s’affichent dans la barre latérale
 7. **Gestion des utilisateurs** (admin) : bouton *Utilisateurs* dans la barre latérale
+8. **Accès par document** (admin) : bouton *Accès* dans l’en‑tête
+9. **Bibliothèques** : gestion et filtre depuis la barre latérale
+10. **Création** : un éditeur a accès automatiquement aux pages qu’il crée
 
 ---
 
@@ -147,6 +177,7 @@ Ouvrir l’URL de votre site.
 - **CSRF** : protection sur toutes les actions sensibles
 - **Rôles** : admin / éditeur / lecteur
 - **Lecteur** : accès en lecture seule (UI verrouillée)
+- **Accès par document** : l’admin choisit qui peut lire/éditer chaque page
 
 ---
 
