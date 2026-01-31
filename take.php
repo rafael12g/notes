@@ -4,6 +4,7 @@
    CREATE TABLE IF NOT EXISTS collab_docs (
        id INT AUTO_INCREMENT PRIMARY KEY,
        title VARCHAR(255) NOT NULL,
+       slug VARCHAR(255) DEFAULT NULL,
        type VARCHAR(30) DEFAULT 'note',
        tags VARCHAR(255) DEFAULT '',
        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -18,7 +19,77 @@
        position INT DEFAULT 0,
        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
    );
+
+   CREATE TABLE IF NOT EXISTS collab_users (
+       id INT AUTO_INCREMENT PRIMARY KEY,
+       username VARCHAR(50) UNIQUE NOT NULL,
+       password_hash VARCHAR(255) NOT NULL,
+       role ENUM('admin','editor','reader') NOT NULL DEFAULT 'editor',
+       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+       last_login TIMESTAMP NULL DEFAULT NULL
+   );
 ========================================================================= */
+
+$secureCookie = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
+session_set_cookie_params([
+    'lifetime' => 0,
+    'path' => '/',
+    'secure' => $secureCookie,
+    'httponly' => true,
+    'samesite' => 'Lax'
+]);
+session_start();
+
+function json_response($data, $status = 200) {
+    http_response_code($status);
+    header('Content-Type: application/json');
+    echo json_encode($data);
+    exit;
+}
+
+function slugify($text) {
+    $text = trim($text);
+    if ($text === '') return 'doc';
+    $text = mb_strtolower($text, 'UTF-8');
+    $text = iconv('UTF-8', 'ASCII//TRANSLIT//IGNORE', $text);
+    $text = preg_replace('/[^a-z0-9]+/i', '-', $text);
+    $text = trim($text, '-');
+    return $text ?: 'doc';
+}
+
+function ensure_unique_slug($pdo, $baseSlug, $excludeId = null) {
+    $slug = $baseSlug;
+    $i = 1;
+    while (true) {
+        if ($excludeId) {
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM collab_docs WHERE slug = ? AND id <> ?");
+            $stmt->execute([$slug, $excludeId]);
+        } else {
+            $stmt = $pdo->prepare("SELECT COUNT(*) FROM collab_docs WHERE slug = ?");
+            $stmt->execute([$slug]);
+        }
+        if ($stmt->fetchColumn() == 0) return $slug;
+        $slug = $baseSlug . '-' . $i;
+        $i++;
+    }
+}
+
+function esc_like($value) {
+    return str_replace(['%', '_'], ['\\%', '\\_'], $value);
+}
+
+function require_auth() {
+    if (empty($_SESSION['user'])) {
+        json_response(['error' => 'Unauthorized'], 401);
+    }
+}
+
+function require_role($roles) {
+    $user = $_SESSION['user'] ?? null;
+    if (!$user || !in_array($user['role'], (array)$roles, true)) {
+        json_response(['error' => 'Forbidden'], 403);
+    }
+}
 
 // --- CONFIGURATION (ENV READY) ---
 $host = getenv('DB_HOST') ?: 'localhost';
@@ -32,10 +103,11 @@ try {
     $pdo->exec("SET NAMES 'utf8mb4'");
 } catch (PDOException $e) { die("Erreur DB : Vérifiez vos identifiants."); }
 
-// --- MIGRATION SIMPLE ---
+// --- MIGRATIONS ---
 $pdo->exec("CREATE TABLE IF NOT EXISTS collab_docs (
     id INT AUTO_INCREMENT PRIMARY KEY,
     title VARCHAR(255) NOT NULL,
+    slug VARCHAR(255) DEFAULT NULL,
     type VARCHAR(30) DEFAULT 'note',
     tags VARCHAR(255) DEFAULT '',
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -51,13 +123,51 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS collab_blocks (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
 )");
 
+$pdo->exec("CREATE TABLE IF NOT EXISTS collab_users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(50) UNIQUE NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    role ENUM('admin','editor','reader') NOT NULL DEFAULT 'editor',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    last_login TIMESTAMP NULL DEFAULT NULL
+)");
+
 try { $pdo->exec("ALTER TABLE collab_blocks ADD COLUMN doc_id INT NOT NULL DEFAULT 1"); } catch (PDOException $e) { /* ignore */ }
 try { $pdo->exec("CREATE INDEX idx_blocks_doc_id ON collab_blocks (doc_id)"); } catch (PDOException $e) { /* ignore */ }
+try { $pdo->exec("ALTER TABLE collab_docs ADD COLUMN slug VARCHAR(255) DEFAULT NULL"); } catch (PDOException $e) { /* ignore */ }
+try { $pdo->exec("CREATE UNIQUE INDEX uniq_docs_slug ON collab_docs (slug)"); } catch (PDOException $e) { /* ignore */ }
+
+$bootstrapWarning = false;
+$userCount = $pdo->query("SELECT COUNT(*) FROM collab_users")->fetchColumn();
+if ((int)$userCount === 0) {
+    $adminUser = getenv('ADMIN_USER') ?: 'admin';
+    $adminPass = getenv('ADMIN_PASS') ?: 'admin';
+    if (!getenv('ADMIN_USER') || !getenv('ADMIN_PASS')) {
+        $bootstrapWarning = true;
+    }
+    $hash = password_hash($adminPass, PASSWORD_DEFAULT);
+    $stmt = $pdo->prepare("INSERT INTO collab_users (username, password_hash, role) VALUES (?, ?, 'admin')");
+    $stmt->execute([$adminUser, $hash]);
+}
+
+if (empty($_SESSION['csrf_token'])) {
+    $_SESSION['csrf_token'] = bin2hex(random_bytes(32));
+}
+
+// Backfill slugs
+$docsWithoutSlug = $pdo->query("SELECT id, title FROM collab_docs WHERE slug IS NULL OR slug = ''")->fetchAll(PDO::FETCH_ASSOC);
+foreach ($docsWithoutSlug as $doc) {
+    $base = slugify($doc['title']);
+    $slug = ensure_unique_slug($pdo, $base, $doc['id']);
+    $stmt = $pdo->prepare("UPDATE collab_docs SET slug = ? WHERE id = ?");
+    $stmt->execute([$slug, $doc['id']]);
+}
 
 $defaultDocId = $pdo->query("SELECT id FROM collab_docs ORDER BY id ASC LIMIT 1")->fetchColumn();
 if (!$defaultDocId) {
-    $stmt = $pdo->prepare("INSERT INTO collab_docs (title, type, tags) VALUES (?, ?, ?)");
-    $stmt->execute(['Mon Wiki', 'wiki', '']);
+    $slug = ensure_unique_slug($pdo, slugify('Mon Wiki'));
+    $stmt = $pdo->prepare("INSERT INTO collab_docs (title, slug, type, tags) VALUES (?, ?, ?, ?)");
+    $stmt->execute(['Mon Wiki', $slug, 'wiki', '']);
     $defaultDocId = (int)$pdo->lastInsertId();
 }
 $stmt = $pdo->prepare("UPDATE collab_blocks SET doc_id = ? WHERE doc_id IS NULL OR doc_id = 0");
@@ -100,26 +210,78 @@ function templateBlocks($type, $title) {
 }
 
 // =========================================================================
-// API BACKEND
+// AUTH & API BACKEND
 // =========================================================================
-if (isset($_GET['action'])) {
-    header('Content-Type: application/json');
-    $input = json_decode(file_get_contents('php://input'), true) ?: [];
+$action = $_GET['action'] ?? null;
+$loginError = null;
 
-    if ($_GET['action'] === 'docs_list') {
-        $stmt = $pdo->query("SELECT id, title, type, tags, created_at, updated_at FROM collab_docs ORDER BY updated_at DESC, id DESC");
-        echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
-        exit;
+if ($action === 'logout') {
+    session_unset();
+    session_destroy();
+    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+    exit;
+}
+
+if ($action === 'login') {
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $payload = json_decode(file_get_contents('php://input'), true);
+        if (!is_array($payload)) {
+            $payload = $_POST;
+        }
+        $token = $payload['csrf'] ?? ($_SERVER['HTTP_X_CSRF_TOKEN'] ?? '');
+        if (!hash_equals($_SESSION['csrf_token'], $token)) {
+            $loginError = 'Jeton CSRF invalide.';
+        } else {
+            $username = trim($payload['username'] ?? '');
+            $password = $payload['password'] ?? '';
+            $stmt = $pdo->prepare("SELECT id, username, password_hash, role FROM collab_users WHERE username = ?");
+            $stmt->execute([$username]);
+            $userRow = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($userRow && password_verify($password, $userRow['password_hash'])) {
+                session_regenerate_id(true);
+                $_SESSION['user'] = [
+                    'id' => (int)$userRow['id'],
+                    'username' => $userRow['username'],
+                    'role' => $userRow['role']
+                ];
+                $pdo->prepare("UPDATE collab_users SET last_login = CURRENT_TIMESTAMP WHERE id = ?")->execute([$userRow['id']]);
+
+                if (isset($_SERVER['HTTP_X_CSRF_TOKEN'])) {
+                    json_response(['status' => 'ok']);
+                }
+                header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
+                exit;
+            }
+            $loginError = 'Identifiants invalides.';
+        }
+    }
+}
+
+if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
+    require_auth();
+    $input = json_decode(file_get_contents('php://input'), true) ?: [];
+    if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+        $token = $_SERVER['HTTP_X_CSRF_TOKEN'] ?? ($input['csrf'] ?? '');
+        if (!hash_equals($_SESSION['csrf_token'], $token)) {
+            json_response(['error' => 'Invalid CSRF token'], 403);
+        }
     }
 
-    if ($_GET['action'] === 'docs_create') {
+    if ($action === 'docs_list') {
+        $stmt = $pdo->query("SELECT id, title, slug, type, tags, created_at, updated_at FROM collab_docs ORDER BY updated_at DESC, id DESC");
+        json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
+    }
+
+    if ($action === 'docs_create') {
+        require_role(['admin', 'editor']);
         $title = trim($input['title'] ?? 'Nouveau document');
         $type = $input['type'] ?? 'note';
         $tags = trim($input['tags'] ?? '');
         $template = $input['template'] ?? $type;
+        $slug = ensure_unique_slug($pdo, slugify($title));
 
-        $stmt = $pdo->prepare("INSERT INTO collab_docs (title, type, tags) VALUES (?, ?, ?)");
-        $stmt->execute([$title, $type, $tags]);
+        $stmt = $pdo->prepare("INSERT INTO collab_docs (title, slug, type, tags) VALUES (?, ?, ?, ?)");
+        $stmt->execute([$title, $slug, $type, $tags]);
         $docId = (int)$pdo->lastInsertId();
 
         $blocks = templateBlocks($template, $title);
@@ -128,40 +290,40 @@ if (isset($_GET['action'])) {
             $stmt->execute([$docId, $content, $index]);
         }
 
-        echo json_encode(["status" => "ok", "id" => $docId]);
-        exit;
+        json_response(["status" => "ok", "id" => $docId]);
     }
 
-    if ($_GET['action'] === 'docs_update') {
+    if ($action === 'docs_update') {
+        require_role(['admin', 'editor']);
         $docId = (int)($input['id'] ?? 0);
         $title = trim($input['title'] ?? '');
         $type = $input['type'] ?? 'note';
         $tags = trim($input['tags'] ?? '');
+        if ($title === '') { json_response(['error' => 'Titre requis'], 422); }
         $stmt = $pdo->prepare("UPDATE collab_docs SET title = ?, type = ?, tags = ? WHERE id = ?");
         $stmt->execute([$title, $type, $tags, $docId]);
-        echo json_encode(["status" => "updated"]);
-        exit;
+        json_response(["status" => "updated"]);
     }
 
-    if ($_GET['action'] === 'docs_delete') {
+    if ($action === 'docs_delete') {
+        require_role(['admin']);
         $docId = (int)($input['id'] ?? 0);
         $stmt = $pdo->prepare("DELETE FROM collab_blocks WHERE doc_id = ?");
         $stmt->execute([$docId]);
         $stmt = $pdo->prepare("DELETE FROM collab_docs WHERE id = ?");
         $stmt->execute([$docId]);
-        echo json_encode(["status" => "deleted"]);
-        exit;
+        json_response(["status" => "deleted"]);
     }
 
-    if ($_GET['action'] === 'fetch') {
-        $docId = (int)($input['doc_id'] ?? ($_GET['doc_id'] ?? $defaultDocId));
+    if ($action === 'fetch') {
+        $docId = (int)($input['doc_id'] ?? $defaultDocId);
         $stmt = $pdo->prepare("SELECT * FROM collab_blocks WHERE doc_id = ? ORDER BY position ASC");
         $stmt->execute([$docId]);
-        echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
-        exit;
+        json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
     }
 
-    if ($_GET['action'] === 'add') {
+    if ($action === 'add') {
+        require_role(['admin', 'editor']);
         $docId = (int)($input['doc_id'] ?? $defaultDocId);
         $maxStmt = $pdo->prepare("SELECT MAX(position) FROM collab_blocks WHERE doc_id = ?");
         $maxStmt->execute([$docId]);
@@ -179,38 +341,184 @@ if (isset($_GET['action'])) {
         $stmt = $pdo->prepare("INSERT INTO collab_blocks (doc_id, type, content, position) VALUES (?, ?, ?, ?)");
         $stmt->execute([$docId, $input['type'], $content, $pos]);
         $pdo->prepare("UPDATE collab_docs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")->execute([$docId]);
-        echo json_encode(["status" => "ok", "id" => $pdo->lastInsertId()]);
-        exit;
+        json_response(["status" => "ok", "id" => $pdo->lastInsertId()]);
     }
 
-    if ($_GET['action'] === 'update') {
+    if ($action === 'update') {
+        require_role(['admin', 'editor']);
         $docId = (int)($input['doc_id'] ?? $defaultDocId);
         $stmt = $pdo->prepare("UPDATE collab_blocks SET content = ? WHERE id = ?");
         $stmt->execute([$input['content'], $input['id']]);
         $pdo->prepare("UPDATE collab_docs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")->execute([$docId]);
-        echo json_encode(["status" => "saved"]);
-        exit;
+        json_response(["status" => "saved"]);
     }
 
-    if ($_GET['action'] === 'reorder') {
+    if ($action === 'reorder') {
+        require_role(['admin', 'editor']);
         $docId = (int)($input['doc_id'] ?? $defaultDocId);
         foreach ($input['order'] as $index => $id) {
             $stmt = $pdo->prepare("UPDATE collab_blocks SET position = ? WHERE id = ? AND doc_id = ?");
             $stmt->execute([$index, $id, $docId]);
         }
         $pdo->prepare("UPDATE collab_docs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")->execute([$docId]);
-        echo json_encode(["status" => "reordered"]);
-        exit;
+        json_response(["status" => "reordered"]);
     }
 
-    if ($_GET['action'] === 'delete') {
+    if ($action === 'delete') {
+        require_role(['admin', 'editor']);
         $docId = (int)($input['doc_id'] ?? $defaultDocId);
         $stmt = $pdo->prepare("DELETE FROM collab_blocks WHERE id = ? AND doc_id = ?");
         $stmt->execute([$input['id'], $docId]);
         $pdo->prepare("UPDATE collab_docs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")->execute([$docId]);
-        echo json_encode(["status" => "deleted"]);
-        exit;
+        json_response(["status" => "deleted"]);
     }
+
+    if ($action === 'backlinks') {
+        $docId = (int)($input['doc_id'] ?? $defaultDocId);
+        $stmt = $pdo->prepare("SELECT id, title, slug FROM collab_docs WHERE id = ?");
+        $stmt->execute([$docId]);
+        $doc = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$doc) json_response([]);
+        $title = esc_like($doc['title']);
+        $slug = esc_like($doc['slug']);
+
+        $stmt = $pdo->prepare("SELECT DISTINCT d.id, d.title, d.slug
+            FROM collab_docs d
+            INNER JOIN collab_blocks b ON b.doc_id = d.id
+            WHERE d.id <> ? AND (b.content LIKE ? OR b.content LIKE ?)
+            ORDER BY d.updated_at DESC
+        ");
+        $stmt->execute([$docId, "%[[{$title}]]%", "%[[{$slug}]]%"]);
+        json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
+    }
+
+    if ($action === 'users_list') {
+        require_role(['admin']);
+        $stmt = $pdo->query("SELECT id, username, role, created_at, last_login FROM collab_users ORDER BY id ASC");
+        json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
+    }
+
+    if ($action === 'users_create') {
+        require_role(['admin']);
+        $username = trim($input['username'] ?? '');
+        $password = $input['password'] ?? '';
+        $role = $input['role'] ?? 'editor';
+        if (strlen($username) < 3 || strlen($password) < 8) {
+            json_response(['error' => 'Nom d’utilisateur (>=3) et mot de passe (>=8) requis'], 422);
+        }
+        if (!in_array($role, ['admin', 'editor', 'reader'], true)) {
+            json_response(['error' => 'Rôle invalide'], 422);
+        }
+        $hash = password_hash($password, PASSWORD_DEFAULT);
+        try {
+            $stmt = $pdo->prepare("INSERT INTO collab_users (username, password_hash, role) VALUES (?, ?, ?)");
+            $stmt->execute([$username, $hash, $role]);
+        } catch (PDOException $e) {
+            json_response(['error' => 'Utilisateur déjà existant'], 409);
+        }
+        json_response(['status' => 'created']);
+    }
+
+    if ($action === 'users_update') {
+        require_role(['admin']);
+        $userId = (int)($input['id'] ?? 0);
+        $role = $input['role'] ?? null;
+        $password = $input['password'] ?? null;
+
+        if ($role && !in_array($role, ['admin', 'editor', 'reader'], true)) {
+            json_response(['error' => 'Rôle invalide'], 422);
+        }
+
+        if ($role) {
+            $adminCount = $pdo->query("SELECT COUNT(*) FROM collab_users WHERE role = 'admin'")->fetchColumn();
+            $isTargetAdmin = $pdo->prepare("SELECT role FROM collab_users WHERE id = ?");
+            $isTargetAdmin->execute([$userId]);
+            $currentRole = $isTargetAdmin->fetchColumn();
+            if ($currentRole === 'admin' && $role !== 'admin' && (int)$adminCount <= 1) {
+                json_response(['error' => 'Au moins un admin est requis'], 409);
+            }
+            $stmt = $pdo->prepare("UPDATE collab_users SET role = ? WHERE id = ?");
+            $stmt->execute([$role, $userId]);
+        }
+        if ($password !== null && $password !== '') {
+            if (strlen($password) < 8) json_response(['error' => 'Mot de passe trop court'], 422);
+            $hash = password_hash($password, PASSWORD_DEFAULT);
+            $stmt = $pdo->prepare("UPDATE collab_users SET password_hash = ? WHERE id = ?");
+            $stmt->execute([$hash, $userId]);
+        }
+        json_response(['status' => 'updated']);
+    }
+
+    if ($action === 'users_delete') {
+        require_role(['admin']);
+        $userId = (int)($input['id'] ?? 0);
+        $currentId = (int)($_SESSION['user']['id'] ?? 0);
+        if ($userId === $currentId) {
+            json_response(['error' => 'Impossible de supprimer votre compte'], 409);
+        }
+        $role = $pdo->prepare("SELECT role FROM collab_users WHERE id = ?");
+        $role->execute([$userId]);
+        $role = $role->fetchColumn();
+        if ($role === 'admin') {
+            $adminCount = $pdo->query("SELECT COUNT(*) FROM collab_users WHERE role = 'admin'")->fetchColumn();
+            if ((int)$adminCount <= 1) {
+                json_response(['error' => 'Au moins un admin est requis'], 409);
+            }
+        }
+        $stmt = $pdo->prepare("DELETE FROM collab_users WHERE id = ?");
+        $stmt->execute([$userId]);
+        json_response(['status' => 'deleted']);
+    }
+
+    if ($action === 'change_password') {
+        require_auth();
+        $currentPassword = $input['current_password'] ?? '';
+        $newPassword = $input['new_password'] ?? '';
+        if (strlen($newPassword) < 8) json_response(['error' => 'Mot de passe trop court'], 422);
+
+        $stmt = $pdo->prepare("SELECT password_hash FROM collab_users WHERE id = ?");
+        $stmt->execute([$_SESSION['user']['id']]);
+        $hash = $stmt->fetchColumn();
+        if (!$hash || !password_verify($currentPassword, $hash)) {
+            json_response(['error' => 'Mot de passe actuel invalide'], 401);
+        }
+        $newHash = password_hash($newPassword, PASSWORD_DEFAULT);
+        $stmt = $pdo->prepare("UPDATE collab_users SET password_hash = ? WHERE id = ?");
+        $stmt->execute([$newHash, $_SESSION['user']['id']]);
+        json_response(['status' => 'updated']);
+    }
+
+    json_response(['error' => 'Action inconnue'], 404);
+}
+
+$currentUser = $_SESSION['user'] ?? null;
+
+if (!$currentUser) {
+    $csrf = htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $errorMsg = $loginError ? '<div class="login-error">' . htmlspecialchars($loginError, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</div>' : '';
+    $bootstrapMsg = $bootstrapWarning ? '<div class="login-warning">⚠️ Compte admin par défaut actif. Définissez ADMIN_USER et ADMIN_PASS.</div>' : '';
+    echo "<!DOCTYPE html><html lang=\"fr\"><head><meta charset=\"UTF-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\"><title>Connexion - CollabDocs</title><style>
+        body{margin:0;font-family:'Segoe UI',Helvetica,sans-serif;background:#0f172a;color:#e2e8f0;display:flex;align-items:center;justify-content:center;height:100vh}
+        .login-card{background:#111827;padding:28px;border-radius:16px;box-shadow:0 20px 40px rgba(0,0,0,.4);width:360px;display:flex;flex-direction:column;gap:12px}
+        .login-card h1{font-size:18px;margin:0;color:#fff}
+        .login-card input{padding:10px 12px;border-radius:8px;border:1px solid #1f2937;background:#0b1220;color:#e2e8f0}
+        .login-card button{background:#4f46e5;border:none;color:#fff;padding:10px 12px;border-radius:8px;font-weight:600;cursor:pointer}
+        .login-error{background:#7f1d1d;color:#fecaca;padding:8px;border-radius:8px;font-size:12px}
+        .login-warning{background:#78350f;color:#fde68a;padding:8px;border-radius:8px;font-size:12px}
+        .login-foot{font-size:12px;color:#94a3b8}
+    </style></head><body>
+        <form class=\"login-card\" method=\"POST\" action=\"?action=login\">
+            <h1>Connexion</h1>
+            $bootstrapMsg
+            $errorMsg
+            <input name=\"username\" placeholder=\"Nom d'utilisateur\" required>
+            <input type=\"password\" name=\"password\" placeholder=\"Mot de passe\" required>
+            <input type=\"hidden\" name=\"csrf\" value=\"$csrf\">
+            <button type=\"submit\">Se connecter</button>
+            <div class=\"login-foot\">Accès protégé · CollabDocs</div>
+        </form>
+    </body></html>";
+    exit;
 }
 ?>
 
@@ -238,6 +546,7 @@ if (isset($_GET['action'])) {
         #sidebar {
             width: 280px; background: var(--sidebar); color: #e2e8f0; padding: 20px; position: fixed; top: 0; bottom: 0; left: 0;
             display: flex; flex-direction: column; gap: 16px; box-shadow: 10px 0 30px rgba(0,0,0,0.15);
+            overflow: hidden;
         }
         .logo { font-size: 18px; font-weight: 700; display: flex; align-items: center; gap: 10px; }
         .logo i { color: #a5b4fc; }
@@ -246,7 +555,7 @@ if (isset($_GET['action'])) {
         .btn-primary:hover { filter: brightness(1.05); }
         .search { background: #111827; border: 1px solid #1f2937; color: #e2e8f0; padding: 10px 12px; border-radius: 8px; }
 
-        #doc-list { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; padding-right: 6px; }
+        #doc-list { display: flex; flex-direction: column; gap: 8px; overflow-y: auto; padding-right: 6px; flex: 1; min-height: 120px; }
         .doc-item {
             background: rgba(255,255,255,0.04); padding: 10px 12px; border-radius: 10px; cursor: pointer; display: flex; justify-content: space-between; gap: 8px; align-items: center;
             border: 1px solid transparent; transition: 0.2s;
@@ -274,6 +583,7 @@ if (isset($_GET['action'])) {
             border: 1px solid #e5e7eb; padding: 6px 8px; border-radius: 8px; background: #fff; font-size: 12px;
         }
         .status { font-size: 12px; color: #6b7280; }
+        .doc-slug { font-size: 11px; color: #94a3b8; background: #f8fafc; padding: 4px 8px; border-radius: 999px; }
 
         #viewport {
             width: min(980px, 100%); min-height: 100vh; margin: 30px auto 80px;
@@ -353,9 +663,24 @@ if (isset($_GET['action'])) {
         .modal { position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: none; align-items: center; justify-content: center; z-index: 300; }
         .modal.show { display: flex; }
         .modal-card { background: #fff; padding: 24px; border-radius: 14px; width: 420px; box-shadow: 0 20px 40px rgba(0,0,0,0.2); display: flex; flex-direction: column; gap: 12px; }
+        .modal-card.large { width: 560px; max-height: 80vh; overflow-y: auto; }
         .modal-card input, .modal-card select { padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 8px; }
         .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
         .btn-ghost { background: #f3f4f6; border: none; padding: 10px 12px; border-radius: 8px; cursor: pointer; }
+        .btn-secondary { background: #111827; color: #e2e8f0; border: 1px solid #1f2937; padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 12px; }
+        .btn-secondary:hover { filter: brightness(1.05); }
+
+        .sidebar-section { display: flex; flex-direction: column; gap: 8px; }
+        .sidebar-title { font-size: 11px; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.08em; }
+        .link-list { display: flex; flex-direction: column; gap: 6px; max-height: 140px; overflow-y: auto; padding-right: 6px; }
+        .link-item { background: rgba(255,255,255,0.05); border: 1px solid transparent; padding: 6px 10px; border-radius: 8px; cursor: pointer; font-size: 12px; color: #e2e8f0; }
+        .link-item:hover { border-color: rgba(255,255,255,0.2); }
+        .link-empty { font-size: 12px; color: #64748b; }
+        .user-panel { display: flex; flex-direction: column; gap: 8px; border-top: 1px solid rgba(148,163,184,0.2); padding-top: 12px; }
+        .user-info { font-size: 12px; color: #cbd5f5; display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+        .role-pill { font-size: 10px; background: rgba(99,102,241,0.2); color: #c7d2fe; padding: 3px 8px; border-radius: 999px; }
+        .logout-link { color: #fca5a5; font-size: 12px; text-decoration: none; }
+        .logout-link:hover { text-decoration: underline; }
 
         @keyframes fadeIn { from { opacity: 0; transform: translateY(5px); } to { opacity: 1; transform: translateY(0); } }
         @keyframes slideUp { from { opacity: 0; transform: translateY(15px); } to { opacity: 1; transform: translateY(0); } }
@@ -370,6 +695,32 @@ if (isset($_GET['action'])) {
             <input id="doc-search" class="search" placeholder="Rechercher...">
         </div>
         <div id="doc-list"></div>
+
+        <div class="sidebar-section">
+            <div class="sidebar-title">Liens wiki</div>
+            <div id="out-links" class="link-list"></div>
+        </div>
+
+        <div class="sidebar-section">
+            <div class="sidebar-title">Backlinks</div>
+            <div id="back-links" class="link-list"></div>
+        </div>
+
+        <div class="user-panel">
+            <div class="user-info">
+                <div>
+                    <strong><?php echo htmlspecialchars($currentUser['username'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></strong>
+                    <div class="role-pill"><?php echo htmlspecialchars($currentUser['role'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?></div>
+                </div>
+                <a class="logout-link" href="?action=logout">Déconnexion</a>
+            </div>
+            <div style="display:flex; gap:8px; flex-wrap: wrap;">
+                <button class="btn-secondary" id="btn-account">Mon compte</button>
+                <?php if ($currentUser['role'] === 'admin') { ?>
+                    <button class="btn-secondary" id="btn-users">Utilisateurs</button>
+                <?php } ?>
+            </div>
+        </div>
     </aside>
 
     <div id="main">
@@ -384,7 +735,10 @@ if (isset($_GET['action'])) {
                 </select>
                 <input type="text" id="doc-tags" class="doc-tags" placeholder="Tags (ex: produit, sprint)">
             </div>
-            <div class="status" id="doc-status">Prêt</div>
+            <div style="display:flex; align-items:center; gap:10px;">
+                <div class="doc-slug" id="doc-slug">slug</div>
+                <div class="status" id="doc-status">Prêt</div>
+            </div>
         </header>
 
         <div id="viewport"></div>
@@ -428,16 +782,60 @@ if (isset($_GET['action'])) {
     </div>
 </div>
 
+<div class="modal" id="account-modal">
+    <div class="modal-card">
+        <h3>Mon compte</h3>
+        <input type="password" id="current-password" placeholder="Mot de passe actuel">
+        <input type="password" id="new-password" placeholder="Nouveau mot de passe (min 8)">
+        <div class="modal-actions">
+            <button class="btn-ghost" id="btn-account-cancel">Annuler</button>
+            <button class="btn-primary" id="btn-account-save">Mettre à jour</button>
+        </div>
+    </div>
+</div>
+
+<?php if ($currentUser['role'] === 'admin') { ?>
+<div class="modal" id="users-modal">
+    <div class="modal-card large">
+        <h3>Gestion des utilisateurs</h3>
+        <div id="users-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+        <div style="border-top:1px solid #e5e7eb; padding-top:12px; display:flex; flex-direction:column; gap:10px;">
+            <strong>Ajouter un utilisateur</strong>
+            <input type="text" id="new-user" placeholder="Nom d'utilisateur">
+            <input type="password" id="new-user-pass" placeholder="Mot de passe (min 8)">
+            <select id="new-user-role">
+                <option value="editor">Éditeur</option>
+                <option value="reader">Lecteur</option>
+                <option value="admin">Admin</option>
+            </select>
+            <button class="btn-primary" id="btn-user-create">Créer</button>
+        </div>
+        <div class="modal-actions">
+            <button class="btn-ghost" id="btn-users-close">Fermer</button>
+        </div>
+    </div>
+</div>
+<?php } ?>
+
 <div id="status">Synchronisé</div>
 
 <script>
+    const csrfToken = "<?php echo htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>";
+    const userRole = "<?php echo htmlspecialchars($currentUser['role'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>";
+    const userName = "<?php echo htmlspecialchars($currentUser['username'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>";
+    const isAdmin = userRole === 'admin';
+    const isEditor = userRole === 'admin' || userRole === 'editor';
+
     const container = document.getElementById('viewport');
     const docList = document.getElementById('doc-list');
     const docTitle = document.getElementById('doc-title');
     const docType = document.getElementById('doc-type');
     const docTags = document.getElementById('doc-tags');
+    const docSlug = document.getElementById('doc-slug');
     const docStatus = document.getElementById('doc-status');
     const docSearch = document.getElementById('doc-search');
+    const outLinks = document.getElementById('out-links');
+    const backLinks = document.getElementById('back-links');
 
     let activeBlockId = null;
     let saveTimer = {};
@@ -451,14 +849,35 @@ if (isset($_GET['action'])) {
         docStatus.innerText = text;
     }
 
+    async function api(action, data = {}) {
+        const res = await fetch(`?action=${action}`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
+            body: JSON.stringify(data)
+        });
+        if (res.status === 401) { location.reload(); }
+        return res;
+    }
+
     function toggleMenu() {
         document.getElementById('menu').classList.toggle('show');
         document.getElementById('btn-plus').classList.toggle('open');
     }
     function addItem(type) { addBlock(type); toggleMenu(); }
 
+    function applyRoleUI() {
+        if (!isEditor) {
+            document.getElementById('btn-plus').style.display = 'none';
+            document.getElementById('menu').style.display = 'none';
+            document.getElementById('btn-new-doc').style.display = 'none';
+            docTitle.setAttribute('readonly', 'readonly');
+            docTags.setAttribute('readonly', 'readonly');
+            docType.setAttribute('disabled', 'disabled');
+        }
+    }
+
     async function loadDocs() {
-        const res = await fetch('?action=docs_list');
+        const res = await api('docs_list');
         docs = await res.json();
         renderDocList();
 
@@ -471,26 +890,29 @@ if (isset($_GET['action'])) {
         const filter = docSearch.value.toLowerCase();
         docList.innerHTML = '';
         docs
-            .filter(d => d.title.toLowerCase().includes(filter) || (d.tags || '').toLowerCase().includes(filter))
+            .filter(d => d.title.toLowerCase().includes(filter) || (d.tags || '').toLowerCase().includes(filter) || (d.slug || '').toLowerCase().includes(filter))
             .forEach(doc => {
                 const item = document.createElement('div');
                 item.className = 'doc-item' + (String(doc.id) === String(currentDocId) ? ' active' : '');
+                const deleteIcon = isAdmin ? '<i class="fa-solid fa-trash doc-delete" title="Supprimer"></i>' : '';
                 item.innerHTML = `
                     <div class="doc-meta">
                         <div class="doc-title-sm">${doc.title}</div>
                         <div class="doc-type">${doc.type}</div>
                     </div>
-                    <i class="fa-solid fa-trash doc-delete" title="Supprimer"></i>
+                    ${deleteIcon}
                 `;
                 item.onclick = (e) => {
                     if (e.target.classList.contains('doc-delete')) return;
                     selectDoc(doc.id);
                 };
-                item.querySelector('.doc-delete').onclick = async () => {
-                    if (!confirm('Supprimer ce document et tous ses blocs ?')) return;
-                    await fetch('?action=docs_delete', { method: 'POST', body: JSON.stringify({ id: doc.id }) });
-                    await loadDocs();
-                };
+                if (isAdmin) {
+                    item.querySelector('.doc-delete').onclick = async () => {
+                        if (!confirm('Supprimer ce document et tous ses blocs ?')) return;
+                        await api('docs_delete', { id: doc.id });
+                        await loadDocs();
+                    };
+                }
                 docList.appendChild(item);
             });
     }
@@ -503,9 +925,11 @@ if (isset($_GET['action'])) {
         docTitle.value = doc.title;
         docType.value = doc.type;
         docTags.value = doc.tags || '';
+        docSlug.innerText = doc.slug ? `slug: ${doc.slug}` : 'slug: -';
         renderDocList();
         if (!skipRefresh) container.innerHTML = '';
         refresh();
+        loadBacklinks();
     }
 
     function openModal() { document.getElementById('doc-modal').classList.add('show'); }
@@ -524,7 +948,7 @@ if (isset($_GET['action'])) {
         const type = document.getElementById('new-type').value;
         const tags = document.getElementById('new-tags').value;
         const template = document.getElementById('new-template').value;
-        const res = await fetch('?action=docs_create', { method: 'POST', body: JSON.stringify({ title, type, tags, template }) });
+        const res = await api('docs_create', { title, type, tags, template });
         const data = await res.json();
         closeModal();
         await loadDocs();
@@ -533,13 +957,90 @@ if (isset($_GET['action'])) {
 
     docSearch.oninput = () => renderDocList();
 
+    // Account modal
+    const accountModal = document.getElementById('account-modal');
+    document.getElementById('btn-account').onclick = () => accountModal.classList.add('show');
+    document.getElementById('btn-account-cancel').onclick = () => accountModal.classList.remove('show');
+    document.getElementById('btn-account-save').onclick = async () => {
+        const currentPassword = document.getElementById('current-password').value;
+        const newPassword = document.getElementById('new-password').value;
+        const res = await api('change_password', { current_password: currentPassword, new_password: newPassword });
+        const data = await res.json();
+        if (data.error) { alert(data.error); return; }
+        alert('Mot de passe mis à jour.');
+        accountModal.classList.remove('show');
+        document.getElementById('current-password').value = '';
+        document.getElementById('new-password').value = '';
+    };
+
+    // Users modal (admin)
+    const usersModal = document.getElementById('users-modal');
+    const usersList = document.getElementById('users-list');
+    if (isAdmin) {
+        document.getElementById('btn-users').onclick = async () => {
+            usersModal.classList.add('show');
+            await loadUsers();
+        };
+        document.getElementById('btn-users-close').onclick = () => usersModal.classList.remove('show');
+        document.getElementById('btn-user-create').onclick = async () => {
+            const username = document.getElementById('new-user').value.trim();
+            const password = document.getElementById('new-user-pass').value;
+            const role = document.getElementById('new-user-role').value;
+            const res = await api('users_create', { username, password, role });
+            const data = await res.json();
+            if (data.error) { alert(data.error); return; }
+            document.getElementById('new-user').value = '';
+            document.getElementById('new-user-pass').value = '';
+            await loadUsers();
+        };
+    }
+
+    async function loadUsers() {
+        if (!isAdmin) return;
+        const res = await api('users_list');
+        const users = await res.json();
+        usersList.innerHTML = '';
+        users.forEach(user => {
+            const row = document.createElement('div');
+            row.style.display = 'grid';
+            row.style.gridTemplateColumns = '1fr 120px 1fr 90px 80px';
+            row.style.gap = '8px';
+            row.style.alignItems = 'center';
+            row.innerHTML = `
+                <div><strong>${user.username}</strong><div style="font-size:11px;color:#6b7280;">${user.role}</div></div>
+                <select class="user-role">
+                    <option value="admin" ${user.role === 'admin' ? 'selected' : ''}>Admin</option>
+                    <option value="editor" ${user.role === 'editor' ? 'selected' : ''}>Éditeur</option>
+                    <option value="reader" ${user.role === 'reader' ? 'selected' : ''}>Lecteur</option>
+                </select>
+                <input class="user-pass" type="password" placeholder="Nouveau mdp">
+                <button class="btn-secondary btn-update">Maj</button>
+                <button class="btn-secondary btn-delete">Suppr</button>
+            `;
+            row.querySelector('.btn-update').onclick = async () => {
+                const role = row.querySelector('.user-role').value;
+                const password = row.querySelector('.user-pass').value;
+                const res = await api('users_update', { id: user.id, role, password });
+                const data = await res.json();
+                if (data.error) { alert(data.error); return; }
+                await loadUsers();
+            };
+            row.querySelector('.btn-delete').onclick = async () => {
+                if (!confirm('Supprimer cet utilisateur ?')) return;
+                const res = await api('users_delete', { id: user.id });
+                const data = await res.json();
+                if (data.error) { alert(data.error); return; }
+                await loadUsers();
+            };
+            usersList.appendChild(row);
+        });
+    }
+
     function scheduleDocMetaSave() {
         clearTimeout(docSaveTimer);
+        if (!isEditor) return;
         docSaveTimer = setTimeout(async () => {
-            await fetch('?action=docs_update', {
-                method: 'POST',
-                body: JSON.stringify({ id: currentDocId, title: docTitle.value, type: docType.value, tags: docTags.value })
-            });
+            await api('docs_update', { id: currentDocId, title: docTitle.value, type: docType.value, tags: docTags.value });
             await loadDocs();
         }, 600);
     }
@@ -547,16 +1048,21 @@ if (isset($_GET['action'])) {
     docType.onchange = scheduleDocMetaSave;
     docTags.oninput = scheduleDocMetaSave;
 
+    let sortableInstance = null;
     document.addEventListener('DOMContentLoaded', () => {
+        applyRoleUI();
         loadDocs();
         setInterval(refresh, 2500);
-        new Sortable(container, {
+        sortableInstance = new Sortable(container, {
             animation: 150, handle: '.drag-handle',
             onEnd: () => {
+                if (!isEditor) return;
                 const order = Array.from(container.children).map(el => el.dataset.id);
-                fetch('?action=reorder', { method: 'POST', body: JSON.stringify({ order, doc_id: currentDocId }) });
+                api('reorder', { order, doc_id: currentDocId });
             }
         });
+        sortableInstance.option('disabled', !isEditor);
+
         document.getElementById('img-up').addEventListener('change', function() {
             if (this.files[0]) {
                 const reader = new FileReader();
@@ -569,9 +1075,9 @@ if (isset($_GET['action'])) {
     async function refresh() {
         if (!currentDocId || activeBlockId) return;
         try {
-            const res = await fetch(`?action=fetch&doc_id=${currentDocId}`);
+            const res = await api('fetch', { doc_id: currentDocId });
             const blocks = await res.json();
-            if (blocks.length === 0 && container.children.length === 0) { addBlock('text'); return; }
+            if (blocks.length === 0 && container.children.length === 0) { if (isEditor) addBlock('text'); return; }
             blocks.forEach(block => {
                 let el = document.getElementById(`blk-${block.id}`);
                 if (!el) renderBlock(block);
@@ -579,21 +1085,95 @@ if (isset($_GET['action'])) {
             });
             const ids = blocks.map(b => parseInt(b.id));
             Array.from(container.children).forEach(child => { if (!ids.includes(parseInt(child.dataset.id))) child.remove(); });
+            updateLinkPanels(blocks);
         } catch (e) {}
     }
 
-    async function addBlock(type, content = null) {
+    function extractWikiLinksFromBlocks(blocks) {
+        const found = new Set();
+        blocks.forEach(block => {
+            if (block.type !== 'text' || !block.content) return;
+            const div = document.createElement('div');
+            div.innerHTML = block.content;
+            const text = div.textContent || '';
+            const regex = /\[\[([^\]]+)\]\]/g;
+            let match;
+            while ((match = regex.exec(text)) !== null) {
+                const link = match[1].trim();
+                if (link) found.add(link);
+            }
+        });
+        return Array.from(found);
+    }
+
+    function resolveDocByLink(linkText) {
+        const norm = linkText.toLowerCase();
+        return docs.find(d => (d.title || '').toLowerCase() === norm || (d.slug || '').toLowerCase() === norm);
+    }
+
+    function renderLinkList(containerEl, links, emptyText, clickHandler) {
+        containerEl.innerHTML = '';
+        if (!links.length) {
+            containerEl.innerHTML = `<div class="link-empty">${emptyText}</div>`;
+            return;
+        }
+        links.forEach(link => {
+            const el = document.createElement('div');
+            el.className = 'link-item';
+            el.textContent = link.label;
+            el.onclick = () => clickHandler(link);
+            containerEl.appendChild(el);
+        });
+    }
+
+    function updateLinkPanels(blocks) {
+        const rawLinks = extractWikiLinksFromBlocks(blocks);
+        const mapped = rawLinks.map(l => {
+            const doc = resolveDocByLink(l);
+            return { label: doc ? doc.title : l, doc, raw: l };
+        });
+        renderLinkList(outLinks, mapped, 'Aucun lien', (link) => openWikiLink(link));
+    }
+
+    async function loadBacklinks() {
         if (!currentDocId) return;
-        await fetch('?action=add', { method: 'POST', body: JSON.stringify({ type, content, doc_id: currentDocId }) });
+        try {
+            const res = await api('backlinks', { doc_id: currentDocId });
+            const data = await res.json();
+            const mapped = data.map(d => ({ label: d.title, doc: d }));
+            renderLinkList(backLinks, mapped, 'Aucun backlink', (link) => selectDoc(link.doc.id));
+        } catch (e) {}
+    }
+
+    async function openWikiLink(link) {
+        if (link.doc) {
+            selectDoc(link.doc.id);
+            return;
+        }
+        if (!isEditor) {
+            alert('Lien introuvable. Demandez à un éditeur de créer la page.');
+            return;
+        }
+        if (!confirm(`Créer la page "${link.raw}" ?`)) return;
+        const res = await api('docs_create', { title: link.raw, type: 'wiki', tags: '', template: 'wiki' });
+        const data = await res.json();
+        await loadDocs();
+        selectDoc(data.id);
+    }
+
+    async function addBlock(type, content = null) {
+        if (!currentDocId || !isEditor) return;
+        await api('add', { type, content, doc_id: currentDocId });
         refresh();
         setTimeout(() => window.scrollTo(0, document.body.scrollHeight), 100);
     }
 
     async function save(id, content) {
+        if (!isEditor) return;
         setStatus('Sauvegarde...');
         clearTimeout(saveTimer[id]);
         saveTimer[id] = setTimeout(async () => {
-            await fetch('?action=update', { method: 'POST', body: JSON.stringify({ id, content, doc_id: currentDocId }) });
+            await api('update', { id, content, doc_id: currentDocId });
             setStatus('Synchronisé');
         }, 800);
     }
@@ -612,6 +1192,9 @@ if (isset($_GET['action'])) {
             <div class="block-content"></div>
         `;
         const contentDiv = div.querySelector('.block-content');
+        if (!isEditor) {
+            div.querySelector('.block-controls').style.display = 'none';
+        }
         container.appendChild(div);
 
         if (block.type === 'text') {
@@ -627,6 +1210,7 @@ if (isset($_GET['action'])) {
             quill.root.innerHTML = block.content || '';
             quill.on('selection-change', r => activeBlockId = r ? block.id : null);
             quill.on('text-change', (d,o,s) => { if (s === 'user') save(block.id, quill.root.innerHTML); });
+            if (!isEditor) quill.enable(false);
         }
         else if (block.type === 'table') {
             const toolbar = document.createElement('div');
@@ -640,6 +1224,7 @@ if (isset($_GET['action'])) {
                 <button class="tbl-btn" onclick="tblAdd(${block.id}, 'col')">+ Col</button>
             `;
             div.appendChild(toolbar);
+            if (!isEditor) toolbar.style.display = 'none';
             contentDiv.innerHTML = `<div class="table-container"><table class="native-table"><tbody></tbody></table></div>`;
 
             div.tableData = JSON.parse(block.content);
@@ -652,6 +1237,7 @@ if (isset($_GET['action'])) {
             const inp = contentDiv.querySelector('.todo-input');
             const doSave = () => { save(block.id, JSON.stringify({text: inp.value, checked: chk.checked})); inp.classList.toggle('todo-done', chk.checked); };
             chk.onchange = doSave; inp.oninput = doSave; inp.onfocus = () => activeBlockId = block.id; inp.onblur = () => activeBlockId = null;
+            if (!isEditor) { chk.disabled = true; inp.readOnly = true; }
         }
         else if (block.type === 'image') { contentDiv.className = 'img-block'; contentDiv.innerHTML = `<img src="${block.content}">`; }
         else if (block.type === 'youtube') {
@@ -670,14 +1256,16 @@ if (isset($_GET['action'])) {
             const tr = document.createElement('tr');
             row.forEach((cellHTML, cI) => {
                 const td = document.createElement('td');
-                td.contentEditable = true;
+                td.contentEditable = isEditor ? 'true' : 'false';
                 td.innerHTML = cellHTML;
-                td.onfocus = () => { activeBlockId = id; lastFocusedCell = td; };
-                td.onblur = () => { activeBlockId = null; };
-                td.oninput = () => {
-                    div.tableData[rI][cI] = td.innerHTML;
-                    save(id, JSON.stringify(div.tableData));
-                };
+                if (isEditor) {
+                    td.onfocus = () => { activeBlockId = id; lastFocusedCell = td; };
+                    td.onblur = () => { activeBlockId = null; };
+                    td.oninput = () => {
+                        div.tableData[rI][cI] = td.innerHTML;
+                        save(id, JSON.stringify(div.tableData));
+                    };
+                }
                 tr.appendChild(td);
             });
             tbody.appendChild(tr);
@@ -685,6 +1273,7 @@ if (isset($_GET['action'])) {
     }
 
     window.tblAdd = (id, type) => {
+        if (!isEditor) return;
         const el = document.getElementById(`blk-${id}`);
         if (type === 'row') el.tableData.push(new Array(el.tableData[0].length).fill(''));
         else el.tableData.forEach(row => row.push(''));
@@ -693,6 +1282,7 @@ if (isset($_GET['action'])) {
     };
 
     window.tblColor = (id, color, type) => {
+        if (!isEditor) return;
         if (!lastFocusedCell) return;
         if (type === 'fore') lastFocusedCell.style.color = color;
         else lastFocusedCell.style.backgroundColor = color;
@@ -700,6 +1290,7 @@ if (isset($_GET['action'])) {
     };
 
     window.tblCmd = (id, cmd) => {
+        if (!isEditor) return;
         if (!lastFocusedCell) return;
         if (cmd === 'bold') lastFocusedCell.style.fontWeight = lastFocusedCell.style.fontWeight === 'bold' ? 'normal' : 'bold';
         lastFocusedCell.dispatchEvent(new Event('input'));
@@ -722,9 +1313,10 @@ if (isset($_GET['action'])) {
     }
 
     async function deleteBlock(id) {
+        if (!isEditor) return;
         if (!confirm('Supprimer ?')) return;
         document.getElementById(`blk-${id}`).remove();
-        await fetch('?action=delete', { method: 'POST', body: JSON.stringify({ id, doc_id: currentDocId }) });
+        await api('delete', { id, doc_id: currentDocId });
     }
 </script>
 </body>

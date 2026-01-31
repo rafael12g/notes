@@ -10,6 +10,8 @@ services:
       DB_NAME: collab_notes
       DB_USER: collab_user
       DB_PASS: collab_pass
+      ADMIN_USER: admin
+      ADMIN_PASS: change-me-now
     depends_on:
       - db
 

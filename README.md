@@ -11,6 +11,8 @@
 - **Éditeur riche** (Quill.js) : titres, styles, couleurs, alignements.
 - **Blocs** : texte, tableau, to‑do, image, YouTube.
 - **Sauvegarde auto** + synchronisation **semi‑temps réel** (polling).
+- **Authentification + rôles** : admin / éditeur / lecteur.
+- **Liens wiki + backlinks** : navigation entre pages via `[[Titre]]`.
 - **Docker prêt** (image Apache + PHP + MySQL).
 
 ---
@@ -48,6 +50,10 @@ Variables d’environnement gérées par Docker :
 - `DB_NAME`
 - `DB_USER`
 - `DB_PASS`
+- `ADMIN_USER`
+- `ADMIN_PASS`
+
+Si `ADMIN_USER` / `ADMIN_PASS` ne sont pas définis, le compte par défaut est **admin / admin** (à changer immédiatement).
 
 ---
 
@@ -58,6 +64,8 @@ Variables d’environnement gérées par Docker :
 3. Ouvrir : `http://IP:8080`
 
 ✅ Le montage de volume côté app a été retiré pour éviter les erreurs **403 / Forbidden** dues aux permissions de fichiers sur l’hôte.
+
+⚠️ **Important** : définissez `ADMIN_USER` et `ADMIN_PASS` pour sécuriser le premier compte admin.
 
 ---
 
@@ -116,6 +124,9 @@ Ouvrir l’URL de votre site.
 3. **Ajouter des blocs** : bouton **+** flottant (texte, tableau, to‑do, image, YouTube)
 4. **Réorganiser** : glisser‑déposer
 5. **Collaborer** : ouverture simultanée possible, sync automatique
+6. **Liens wiki** : écrire `[[Titre d'une page]]` pour créer un lien
+    - Les **liens sortants** et **backlinks** s’affichent dans la barre latérale
+7. **Gestion des utilisateurs** (admin) : bouton *Utilisateurs* dans la barre latérale
 
 ---
 
@@ -132,7 +143,10 @@ Ouvrir l’URL de votre site.
 
 - **Collaboration** via polling (2,5s)
 - **Conflit d’édition** : le dernier enregistrement l’emporte si édition concurrente
-- **Conseillé** : ajouter un système d’authentification si exposition publique
+- **Authentification** : sessions sécurisées + mots de passe hashés (bcrypt)
+- **CSRF** : protection sur toutes les actions sensibles
+- **Rôles** : admin / éditeur / lecteur
+- **Lecteur** : accès en lecture seule (UI verrouillée)
 
 ---
 
@@ -161,8 +175,6 @@ Ouvrir l’URL de votre site.
 ## ✅ Roadmap
 
 **Court terme**
-- Authentification + rôles (admin/éditeur/lecteur)
-- Pages liées (liens wiki + backlinks)
 - Amélioration de la collaboration (verrou léger par bloc)
 
 **Moyen terme**
