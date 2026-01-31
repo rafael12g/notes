@@ -1,0 +1,31 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8080:80"
+    environment:
+      DB_HOST: db
+      DB_NAME: collab_notes
+      DB_USER: collab_user
+      DB_PASS: collab_pass
+    depends_on:
+      - db
+    volumes:
+      - ./take.php:/var/www/html/index.php
+
+  db:
+    image: mysql:8.0
+    command: --default-authentication-plugin=mysql_native_password
+    environment:
+      MYSQL_DATABASE: collab_notes
+      MYSQL_USER: collab_user
+      MYSQL_PASSWORD: collab_pass
+      MYSQL_ROOT_PASSWORD: rootpass
+    volumes:
+      - dbdata:/var/lib/mysql
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+
+volumes:
+  dbdata:
