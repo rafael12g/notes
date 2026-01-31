@@ -12,8 +12,6 @@ services:
       DB_PASS: collab_pass
     depends_on:
       - db
-    volumes:
-      - ./:/var/www/html
 
   db:
     image: mysql:8.0
