@@ -14,6 +14,13 @@
 - **Authentification + rôles** : admin / éditeur / lecteur.
 - **Liens wiki + backlinks** : navigation entre pages via `[[Titre]]`.
 - **Bibliothèques** : organisation des documents par collections.
+- **Recherche globale** : titres, tags, contenu.
+- **Historique** : versions et restauration.
+- **Commentaires** par bloc.
+- **Import/Export** : HTML / Markdown.
+- **Fichiers** : upload et pièces jointes.
+- **Thème** : clair / sombre.
+- **Mode hors‑ligne** : file d’attente de synchro.
 - **Docker prêt** (image Apache + PHP + MySQL).
 
 ---
@@ -65,6 +72,7 @@ Si `ADMIN_USER` / `ADMIN_PASS` ne sont pas définis, le compte par défaut est *
 3. Ouvrir : `http://IP:8080`
 
 ✅ Le montage de volume côté app a été retiré pour éviter les erreurs **403 / Forbidden** dues aux permissions de fichiers sur l’hôte.
+✅ Les uploads sont persistés via un volume nommé `uploads`.
 
 ⚠️ **Important** : un compte admin **admin/admin** est disponible pour le bootstrap, et un **changement obligatoire** est demandé à la première connexion.
 Pour les nouveaux utilisateurs, l’admin attribue l’accès par document.
@@ -125,6 +133,34 @@ CREATE TABLE IF NOT EXISTS collab_doc_access (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
     PRIMARY KEY (user_id, doc_id)
 );
+
+CREATE TABLE IF NOT EXISTS collab_versions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    doc_id INT NOT NULL,
+    block_id INT NOT NULL,
+    user_id INT NOT NULL,
+    content LONGTEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS collab_comments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    doc_id INT NOT NULL,
+    block_id INT NOT NULL,
+    user_id INT NOT NULL,
+    comment TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS collab_files (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    doc_id INT NOT NULL,
+    user_id INT NOT NULL,
+    original_name VARCHAR(255) NOT NULL,
+    stored_name VARCHAR(255) NOT NULL,
+    size INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
 ```
 
 ### 3) Configuration DB
@@ -157,6 +193,11 @@ Ouvrir l’URL de votre site.
 8. **Accès par document** (admin) : bouton *Accès* dans l’en‑tête
 9. **Bibliothèques** : gestion et filtre depuis la barre latérale
 10. **Création** : un éditeur a accès automatiquement aux pages qu’il crée
+11. **Recherche** : bouton *Recherche* dans l’en‑tête
+12. **Exporter/Importer** : boutons *Exporter* / *Importer*
+13. **Historique** : bouton *Historique* pour restaurer une version
+14. **Commentaires** : icône de commentaire sur chaque bloc
+15. **Fichiers** : bouton *Fichiers* + ajout en bloc
 
 ---
 
@@ -178,6 +219,7 @@ Ouvrir l’URL de votre site.
 - **Rôles** : admin / éditeur / lecteur
 - **Lecteur** : accès en lecture seule (UI verrouillée)
 - **Accès par document** : l’admin choisit qui peut lire/éditer chaque page
+- **Uploads** : fichiers stockés dans /uploads
 
 ---
 
@@ -209,13 +251,11 @@ Ouvrir l’URL de votre site.
 - Amélioration de la collaboration (verrou léger par bloc)
 
 **Moyen terme**
-- Historique des versions par document
-- Export PDF / DOCX / Markdown
-- Import Markdown / HTML
+- Export PDF / DOCX
+- Mentions et notifications
 
 **Long terme**
 - API REST publique
-- Notifications (mentions, tâches)
 - SSO (OIDC) pour usage entreprise
 
 ---

@@ -44,6 +44,34 @@
        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
        PRIMARY KEY (user_id, doc_id)
    );
+
+   CREATE TABLE IF NOT EXISTS collab_versions (
+       id INT AUTO_INCREMENT PRIMARY KEY,
+       doc_id INT NOT NULL,
+       block_id INT NOT NULL,
+       user_id INT NOT NULL,
+       content LONGTEXT,
+       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   );
+
+   CREATE TABLE IF NOT EXISTS collab_comments (
+       id INT AUTO_INCREMENT PRIMARY KEY,
+       doc_id INT NOT NULL,
+       block_id INT NOT NULL,
+       user_id INT NOT NULL,
+       comment TEXT NOT NULL,
+       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   );
+
+   CREATE TABLE IF NOT EXISTS collab_files (
+       id INT AUTO_INCREMENT PRIMARY KEY,
+       doc_id INT NOT NULL,
+       user_id INT NOT NULL,
+       original_name VARCHAR(255) NOT NULL,
+       stored_name VARCHAR(255) NOT NULL,
+       size INT NOT NULL DEFAULT 0,
+       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+   );
 ========================================================================= */
 
 $secureCookie = (!empty($_SERVER['HTTPS']) && $_SERVER['HTTPS'] !== 'off');
@@ -177,6 +205,34 @@ $pdo->exec("CREATE TABLE IF NOT EXISTS collab_doc_access (
     PRIMARY KEY (user_id, doc_id)
 )");
 
+$pdo->exec("CREATE TABLE IF NOT EXISTS collab_versions (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    doc_id INT NOT NULL,
+    block_id INT NOT NULL,
+    user_id INT NOT NULL,
+    content LONGTEXT,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)");
+
+$pdo->exec("CREATE TABLE IF NOT EXISTS collab_comments (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    doc_id INT NOT NULL,
+    block_id INT NOT NULL,
+    user_id INT NOT NULL,
+    comment TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)");
+
+$pdo->exec("CREATE TABLE IF NOT EXISTS collab_files (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    doc_id INT NOT NULL,
+    user_id INT NOT NULL,
+    original_name VARCHAR(255) NOT NULL,
+    stored_name VARCHAR(255) NOT NULL,
+    size INT NOT NULL DEFAULT 0,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+)");
+
 try { $pdo->exec("ALTER TABLE collab_blocks ADD COLUMN doc_id INT NOT NULL DEFAULT 1"); } catch (PDOException $e) { /* ignore */ }
 try { $pdo->exec("CREATE INDEX idx_blocks_doc_id ON collab_blocks (doc_id)"); } catch (PDOException $e) { /* ignore */ }
 try { $pdo->exec("ALTER TABLE collab_docs ADD COLUMN slug VARCHAR(255) DEFAULT NULL"); } catch (PDOException $e) { /* ignore */ }
@@ -263,6 +319,42 @@ function templateBlocks($type, $title) {
         default:
             return ["<h1>$safeTitle</h1><p>...</p>"];
     }
+}
+
+function html_to_markdown($html) {
+    $html = preg_replace('/\r\n|\r/', "\n", $html);
+    $html = preg_replace('/<h1[^>]*>(.*?)<\/h1>/i', "# $1\n\n", $html);
+    $html = preg_replace('/<h2[^>]*>(.*?)<\/h2>/i', "## $1\n\n", $html);
+    $html = preg_replace('/<h3[^>]*>(.*?)<\/h3>/i', "### $1\n\n", $html);
+    $html = preg_replace('/<strong[^>]*>(.*?)<\/strong>/i', "**$1**", $html);
+    $html = preg_replace('/<b[^>]*>(.*?)<\/b>/i', "**$1**", $html);
+    $html = preg_replace('/<em[^>]*>(.*?)<\/em>/i', "*$1*", $html);
+    $html = preg_replace('/<i[^>]*>(.*?)<\/i>/i', "*$1*", $html);
+    $html = preg_replace('/<u[^>]*>(.*?)<\/u>/i', "_$1_", $html);
+    $html = preg_replace('/<li[^>]*>(.*?)<\/li>/i', "- $1\n", $html);
+    $html = preg_replace('/<p[^>]*>(.*?)<\/p>/i', "$1\n\n", $html);
+    $html = strip_tags($html);
+    $html = html_entity_decode($html, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $html = preg_replace("/\n{3,}/", "\n\n", $html);
+    return trim($html);
+}
+
+function markdown_to_html($md) {
+    $md = htmlspecialchars($md, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8');
+    $md = preg_replace('/^### (.*)$/m', '<h3>$1</h3>', $md);
+    $md = preg_replace('/^## (.*)$/m', '<h2>$1</h2>', $md);
+    $md = preg_replace('/^# (.*)$/m', '<h1>$1</h1>', $md);
+    $md = preg_replace('/\*\*(.*?)\*\*/', '<strong>$1</strong>', $md);
+    $md = preg_replace('/\*(.*?)\*/', '<em>$1</em>', $md);
+    $md = preg_replace('/^\- (.*)$/m', '<li>$1</li>', $md);
+    $md = preg_replace('/(<li>.*<\/li>\s*)+/m', '<ul>$0</ul>', $md);
+    $lines = preg_split('/\n{2,}/', $md);
+    $html = '';
+    foreach ($lines as $line) {
+        if (preg_match('/^<h[1-3]>|^<ul>/', $line)) $html .= $line . "\n";
+        else $html .= '<p>' . trim($line) . '</p>\n';
+    }
+    return $html;
 }
 
 // =========================================================================
@@ -443,6 +535,7 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
         if ($input['type'] === 'todo') $content = json_encode(['text' => 'Nouvelle tâche', 'checked' => false]);
         if ($input['type'] === 'image') $content = $input['content'] ?? '';
         if ($input['type'] === 'youtube') $content = $input['content'] ?? '';
+        if ($input['type'] === 'file') $content = $input['content'] ?? '';
 
         $stmt = $pdo->prepare("INSERT INTO collab_blocks (doc_id, type, content, position) VALUES (?, ?, ?, ?)");
         $stmt->execute([$docId, $input['type'], $content, $pos]);
@@ -456,6 +549,8 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
         require_doc_access($pdo, $_SESSION['user'], $docId, true);
         $stmt = $pdo->prepare("UPDATE collab_blocks SET content = ? WHERE id = ?");
         $stmt->execute([$input['content'], $input['id']]);
+        $stmt = $pdo->prepare("INSERT INTO collab_versions (doc_id, block_id, user_id, content) VALUES (?, ?, ?, ?)");
+        $stmt->execute([$docId, $input['id'], $_SESSION['user']['id'], $input['content']]);
         $pdo->prepare("UPDATE collab_docs SET updated_at = CURRENT_TIMESTAMP WHERE id = ?")->execute([$docId]);
         json_response(["status" => "saved"]);
     }
@@ -653,6 +748,189 @@ if (isset($_GET['action']) && !in_array($action, ['login', 'logout'], true)) {
         json_response(['status' => 'updated']);
     }
 
+    if ($action === 'versions_list') {
+        $docId = (int)($input['doc_id'] ?? 0);
+        require_doc_access($pdo, $_SESSION['user'], $docId, false);
+        $stmt = $pdo->prepare("SELECT v.id, v.block_id, v.user_id, v.created_at, u.username
+            FROM collab_versions v
+            INNER JOIN collab_users u ON u.id = v.user_id
+            WHERE v.doc_id = ?
+            ORDER BY v.id DESC
+            LIMIT 50");
+        $stmt->execute([$docId]);
+        json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
+    }
+
+    if ($action === 'versions_restore') {
+        require_role(['admin', 'editor']);
+        $versionId = (int)($input['version_id'] ?? 0);
+        $stmt = $pdo->prepare("SELECT doc_id, block_id, content FROM collab_versions WHERE id = ?");
+        $stmt->execute([$versionId]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$row) json_response(['error' => 'Version introuvable'], 404);
+        $docId = (int)$row['doc_id'];
+        require_doc_access($pdo, $_SESSION['user'], $docId, true);
+        $stmt = $pdo->prepare("UPDATE collab_blocks SET content = ? WHERE id = ? AND doc_id = ?");
+        $stmt->execute([$row['content'], $row['block_id'], $docId]);
+        json_response(['status' => 'restored']);
+    }
+
+    if ($action === 'comments_list') {
+        $docId = (int)($input['doc_id'] ?? 0);
+        $blockId = (int)($input['block_id'] ?? 0);
+        require_doc_access($pdo, $_SESSION['user'], $docId, false);
+        $stmt = $pdo->prepare("SELECT c.id, c.comment, c.created_at, u.username, u.id AS user_id
+            FROM collab_comments c
+            INNER JOIN collab_users u ON u.id = c.user_id
+            WHERE c.doc_id = ? AND c.block_id = ?
+            ORDER BY c.id ASC");
+        $stmt->execute([$docId, $blockId]);
+        json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
+    }
+
+    if ($action === 'comments_add') {
+        $docId = (int)($input['doc_id'] ?? 0);
+        $blockId = (int)($input['block_id'] ?? 0);
+        $comment = trim($input['comment'] ?? '');
+        if ($comment === '') json_response(['error' => 'Commentaire vide'], 422);
+        require_doc_access($pdo, $_SESSION['user'], $docId, false);
+        $stmt = $pdo->prepare("INSERT INTO collab_comments (doc_id, block_id, user_id, comment) VALUES (?, ?, ?, ?)");
+        $stmt->execute([$docId, $blockId, $_SESSION['user']['id'], $comment]);
+        json_response(['status' => 'created']);
+    }
+
+    if ($action === 'comments_delete') {
+        $commentId = (int)($input['id'] ?? 0);
+        $stmt = $pdo->prepare("SELECT doc_id, user_id FROM collab_comments WHERE id = ?");
+        $stmt->execute([$commentId]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$row) json_response(['error' => 'Commentaire introuvable'], 404);
+        $docId = (int)$row['doc_id'];
+        require_doc_access($pdo, $_SESSION['user'], $docId, false);
+        if ($_SESSION['user']['role'] !== 'admin' && (int)$row['user_id'] !== (int)$_SESSION['user']['id']) {
+            json_response(['error' => 'Forbidden'], 403);
+        }
+        $stmt = $pdo->prepare("DELETE FROM collab_comments WHERE id = ?");
+        $stmt->execute([$commentId]);
+        json_response(['status' => 'deleted']);
+    }
+
+    if ($action === 'search') {
+        $q = trim($input['q'] ?? '');
+        if ($q === '') json_response([]);
+        $like = '%' . esc_like($q) . '%';
+        if ($_SESSION['user']['role'] === 'admin') {
+            $stmt = $pdo->prepare("SELECT DISTINCT d.id, d.title, d.slug
+                FROM collab_docs d
+                LEFT JOIN collab_blocks b ON b.doc_id = d.id
+                WHERE d.title LIKE ? OR d.tags LIKE ? OR b.content LIKE ?
+                ORDER BY d.updated_at DESC LIMIT 50");
+            $stmt->execute([$like, $like, $like]);
+            json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
+        }
+        $stmt = $pdo->prepare("SELECT DISTINCT d.id, d.title, d.slug
+            FROM collab_docs d
+            INNER JOIN collab_doc_access da ON da.doc_id = d.id AND da.user_id = ?
+            LEFT JOIN collab_blocks b ON b.doc_id = d.id
+            WHERE d.title LIKE ? OR d.tags LIKE ? OR b.content LIKE ?
+            ORDER BY d.updated_at DESC LIMIT 50");
+        $stmt->execute([$_SESSION['user']['id'], $like, $like, $like]);
+        json_response($stmt->fetchAll(PDO::FETCH_ASSOC));
+    }
+
+    if ($action === 'export') {
+        $docId = (int)($input['doc_id'] ?? 0);
+        $format = $input['format'] ?? 'html';
+        require_doc_access($pdo, $_SESSION['user'], $docId, false);
+        $stmt = $pdo->prepare("SELECT title FROM collab_docs WHERE id = ?");
+        $stmt->execute([$docId]);
+        $title = $stmt->fetchColumn() ?: 'document';
+
+        $stmt = $pdo->prepare("SELECT * FROM collab_blocks WHERE doc_id = ? ORDER BY position ASC");
+        $stmt->execute([$docId]);
+        $blocks = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        $html = '';
+        foreach ($blocks as $b) {
+            if ($b['type'] === 'text') $html .= $b['content'] . "\n";
+            elseif ($b['type'] === 'todo') {
+                $d = json_decode($b['content'], true);
+                $html .= '<p>' . ($d['checked'] ? '☑ ' : '☐ ') . htmlspecialchars($d['text'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>\n';
+            }
+            elseif ($b['type'] === 'image') $html .= '<p><img src="' . htmlspecialchars($b['content'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '"></p>\n';
+            elseif ($b['type'] === 'youtube') $html .= '<p>https://www.youtube.com/watch?v=' . htmlspecialchars($b['content'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>\n';
+            elseif ($b['type'] === 'file') {
+                $f = json_decode($b['content'], true);
+                $html .= '<p><a href="' . htmlspecialchars($f['url'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">' . htmlspecialchars($f['name'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a></p>\n';
+            }
+        }
+        if ($format === 'markdown') {
+            $md = html_to_markdown($html);
+            json_response(['title' => $title, 'content' => $md, 'format' => 'markdown']);
+        }
+        json_response(['title' => $title, 'content' => $html, 'format' => 'html']);
+    }
+
+    if ($action === 'import') {
+        require_role(['admin', 'editor']);
+        $docId = (int)($input['doc_id'] ?? 0);
+        $format = $input['format'] ?? 'markdown';
+        $content = $input['content'] ?? '';
+        require_doc_access($pdo, $_SESSION['user'], $docId, true);
+        $html = $format === 'html' ? $content : markdown_to_html($content);
+
+        $maxStmt = $pdo->prepare("SELECT MAX(position) FROM collab_blocks WHERE doc_id = ?");
+        $maxStmt->execute([$docId]);
+        $max = $maxStmt->fetchColumn();
+        $pos = ($max !== false && $max !== null) ? $max + 1 : 0;
+        $stmt = $pdo->prepare("INSERT INTO collab_blocks (doc_id, type, content, position) VALUES (?, 'text', ?, ?)");
+        $stmt->execute([$docId, $html, $pos]);
+        json_response(['status' => 'imported']);
+    }
+
+    if ($action === 'files_upload') {
+        require_role(['admin', 'editor']);
+        $docId = (int)($_POST['doc_id'] ?? 0);
+        require_doc_access($pdo, $_SESSION['user'], $docId, true);
+        if (!isset($_FILES['file'])) json_response(['error' => 'Fichier manquant'], 422);
+        $file = $_FILES['file'];
+        if ($file['error'] !== UPLOAD_ERR_OK) json_response(['error' => 'Upload échoué'], 400);
+        $ext = pathinfo($file['name'], PATHINFO_EXTENSION);
+        $safeName = bin2hex(random_bytes(16)) . ($ext ? "." . $ext : "");
+        $uploadDir = __DIR__ . '/uploads';
+        if (!is_dir($uploadDir)) @mkdir($uploadDir, 0777, true);
+        $dest = $uploadDir . '/' . $safeName;
+        if (!move_uploaded_file($file['tmp_name'], $dest)) json_response(['error' => 'Impossible de sauvegarder'], 500);
+        $stmt = $pdo->prepare("INSERT INTO collab_files (doc_id, user_id, original_name, stored_name, size) VALUES (?, ?, ?, ?, ?)");
+        $stmt->execute([$docId, $_SESSION['user']['id'], $file['name'], $safeName, (int)$file['size']]);
+        $url = 'uploads/' . $safeName;
+        json_response(['status' => 'uploaded', 'name' => $file['name'], 'url' => $url, 'id' => $pdo->lastInsertId()]);
+    }
+
+    if ($action === 'files_list') {
+        $docId = (int)($input['doc_id'] ?? 0);
+        require_doc_access($pdo, $_SESSION['user'], $docId, false);
+        $stmt = $pdo->prepare("SELECT id, original_name, stored_name, size, created_at FROM collab_files WHERE doc_id = ? ORDER BY id DESC");
+        $stmt->execute([$docId]);
+        $files = $stmt->fetchAll(PDO::FETCH_ASSOC);
+        foreach ($files as &$f) { $f['url'] = 'uploads/' . $f['stored_name']; }
+        json_response($files);
+    }
+
+    if ($action === 'files_delete') {
+        require_role(['admin', 'editor']);
+        $fileId = (int)($input['id'] ?? 0);
+        $stmt = $pdo->prepare("SELECT doc_id, stored_name FROM collab_files WHERE id = ?");
+        $stmt->execute([$fileId]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if (!$row) json_response(['error' => 'Fichier introuvable'], 404);
+        require_doc_access($pdo, $_SESSION['user'], (int)$row['doc_id'], true);
+        $stmt = $pdo->prepare("DELETE FROM collab_files WHERE id = ?");
+        $stmt->execute([$fileId]);
+        $path = __DIR__ . '/uploads/' . $row['stored_name'];
+        if (is_file($path)) @unlink($path);
+        json_response(['status' => 'deleted']);
+    }
+
     if ($action === 'change_credentials') {
         require_auth();
         $currentPassword = $input['current_password'] ?? '';
@@ -746,6 +1024,13 @@ if (!$currentUser) {
 
     <style>
         :root { --bg: #f3f4f6; --paper: #ffffff; --primary: #4f46e5; --text: #111827; --sidebar: #0f172a; }
+        [data-theme="dark"] {
+            --bg: #0b1120;
+            --paper: #0f172a;
+            --primary: #6366f1;
+            --text: #e5e7eb;
+            --sidebar: #020617;
+        }
         * { box-sizing: border-box; }
         body { background: var(--bg); margin: 0; font-family: 'Segoe UI', Helvetica, sans-serif; color: var(--text); }
 
@@ -873,7 +1158,7 @@ if (!$currentUser) {
         .modal.show { display: flex; }
         .modal-card { background: #fff; padding: 24px; border-radius: 14px; width: 420px; box-shadow: 0 20px 40px rgba(0,0,0,0.2); display: flex; flex-direction: column; gap: 12px; }
         .modal-card.large { width: 560px; max-height: 80vh; overflow-y: auto; }
-        .modal-card input, .modal-card select { padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 8px; }
+        .modal-card input, .modal-card select, .modal-card textarea { padding: 10px 12px; border: 1px solid #e5e7eb; border-radius: 8px; font-family: inherit; }
         .modal-actions { display: flex; justify-content: flex-end; gap: 10px; }
         .btn-ghost { background: #f3f4f6; border: none; padding: 10px 12px; border-radius: 8px; cursor: pointer; }
         .btn-secondary { background: #111827; color: #e2e8f0; border: 1px solid #1f2937; padding: 8px 10px; border-radius: 8px; cursor: pointer; font-size: 12px; }
@@ -954,9 +1239,16 @@ if (!$currentUser) {
                 <input type="text" id="doc-tags" class="doc-tags" placeholder="Tags (ex: produit, sprint)">
             </div>
             <div style="display:flex; align-items:center; gap:10px;">
+                <div id="offline-badge" style="display:none; font-size:11px; color:#b45309; background:#fef3c7; padding:4px 8px; border-radius:999px;">Hors‑ligne</div>
+                <button class="btn-secondary" id="btn-search">Recherche</button>
+                <button class="btn-secondary" id="btn-export">Exporter</button>
+                <button class="btn-secondary" id="btn-import">Importer</button>
+                <button class="btn-secondary" id="btn-history">Historique</button>
+                <button class="btn-secondary" id="btn-files">Fichiers</button>
                 <?php if ($currentUser['role'] === 'admin') { ?>
                     <button class="btn-secondary" id="btn-access">Accès</button>
                 <?php } ?>
+                <button class="btn-secondary" id="btn-theme">Thème</button>
                 <div class="doc-slug" id="doc-slug">slug</div>
                 <div class="status" id="doc-status">Prêt</div>
             </div>
@@ -973,6 +1265,7 @@ if (!$currentUser) {
         <div class="fab-item" onclick="addItem('todo')">To-Do <i class="fa-solid fa-check-square"></i></div>
         <div class="fab-item" onclick="document.getElementById('img-up').click()">Image <i class="fa-regular fa-image"></i></div>
         <div class="fab-item" onclick="addItem('youtube')">YouTube <i class="fa-brands fa-youtube"></i></div>
+        <div class="fab-item" onclick="openFilesModal()">Fichier <i class="fa-regular fa-file"></i></div>
     </div>
     <button class="fab-main" onclick="toggleMenu()" id="btn-plus"><i class="fa-solid fa-plus"></i></button>
 </div>
@@ -1056,6 +1349,79 @@ if (!$currentUser) {
     </div>
 </div>
 
+<div class="modal" id="search-modal">
+    <div class="modal-card large">
+        <h3>Recherche globale</h3>
+        <input type="text" id="search-input" placeholder="Tapez pour rechercher...">
+        <div id="search-results" style="display:flex; flex-direction:column; gap:8px;"></div>
+        <div class="modal-actions">
+            <button class="btn-ghost" id="btn-search-close">Fermer</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="export-modal">
+    <div class="modal-card">
+        <h3>Exporter</h3>
+        <select id="export-format">
+            <option value="html">HTML</option>
+            <option value="markdown">Markdown</option>
+        </select>
+        <button class="btn-primary" id="btn-export-do">Télécharger</button>
+        <div class="modal-actions">
+            <button class="btn-ghost" id="btn-export-close">Fermer</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="import-modal">
+    <div class="modal-card large">
+        <h3>Importer</h3>
+        <select id="import-format">
+            <option value="markdown">Markdown</option>
+            <option value="html">HTML</option>
+        </select>
+        <textarea id="import-content" rows="10" placeholder="Collez votre contenu..."></textarea>
+        <div class="modal-actions">
+            <button class="btn-ghost" id="btn-import-cancel">Annuler</button>
+            <button class="btn-primary" id="btn-import-do">Importer</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="history-modal">
+    <div class="modal-card large">
+        <h3>Historique des versions</h3>
+        <div id="history-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+        <div class="modal-actions">
+            <button class="btn-ghost" id="btn-history-close">Fermer</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="comments-modal">
+    <div class="modal-card large">
+        <h3>Commentaires</h3>
+        <div id="comments-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+        <textarea id="comment-input" rows="3" placeholder="Ajouter un commentaire..."></textarea>
+        <div class="modal-actions">
+            <button class="btn-ghost" id="btn-comments-close">Fermer</button>
+            <button class="btn-primary" id="btn-comment-add">Ajouter</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" id="files-modal">
+    <div class="modal-card large">
+        <h3>Fichiers</h3>
+        <div id="files-list" style="display:flex; flex-direction:column; gap:8px;"></div>
+        <input type="file" id="file-upload" />
+        <div class="modal-actions">
+            <button class="btn-ghost" id="btn-files-close">Fermer</button>
+        </div>
+    </div>
+</div>
+
 <?php if ($currentUser['role'] === 'admin') { ?>
 <div class="modal" id="users-modal">
     <div class="modal-card large">
@@ -1085,6 +1451,7 @@ if (!$currentUser) {
     const csrfToken = "<?php echo htmlspecialchars($_SESSION['csrf_token'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>";
     const userRole = "<?php echo htmlspecialchars($currentUser['role'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>";
     const userName = "<?php echo htmlspecialchars($currentUser['username'], ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'); ?>";
+    const userId = <?php echo (int)$currentUser['id']; ?>;
     const mustChange = <?php echo !empty($currentUser['must_change']) ? 'true' : 'false'; ?>;
     const isAdmin = userRole === 'admin';
     const canCreate = isAdmin || userRole === 'editor';
@@ -1103,6 +1470,7 @@ if (!$currentUser) {
     const backLinks = document.getElementById('back-links');
     const libraryList = document.getElementById('library-list');
     const newLibrarySelect = document.getElementById('new-library');
+    const offlineBadge = document.getElementById('offline-badge');
 
     let activeBlockId = null;
     let saveTimer = {};
@@ -1119,7 +1487,39 @@ if (!$currentUser) {
         docStatus.innerText = text;
     }
 
-    async function api(action, data = {}) {
+    const writeActions = new Set([
+        'docs_create','docs_update','docs_delete','add','update','delete','reorder',
+        'comments_add','comments_delete','files_delete','files_upload','import',
+        'libraries_create','libraries_delete','doc_access_update','users_create','users_update','users_delete'
+    ]);
+
+    function getQueue() {
+        try { return JSON.parse(localStorage.getItem('offlineQueue') || '[]'); } catch { return []; }
+    }
+    function setQueue(q) { localStorage.setItem('offlineQueue', JSON.stringify(q)); }
+    async function flushQueue() {
+        const queue = getQueue();
+        if (!queue.length) return;
+        const remaining = [];
+        for (const item of queue) {
+            try {
+                await api(item.action, item.data, true);
+            } catch (e) {
+                remaining.push(item);
+            }
+        }
+        setQueue(remaining);
+        if (!remaining.length) setStatus('Synchronisé');
+    }
+
+    async function api(action, data = {}, isRetry = false) {
+        if (!navigator.onLine && writeActions.has(action) && !isRetry) {
+            const queue = getQueue();
+            queue.push({ action, data });
+            setQueue(queue);
+            setStatus('Hors‑ligne : en attente');
+            return { status: 202, json: async () => ({ queued: true }) };
+        }
         const res = await fetch(`?action=${action}`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json', 'X-CSRF-Token': csrfToken },
@@ -1298,6 +1698,197 @@ if (!$currentUser) {
         accountModal.classList.remove('show');
         document.getElementById('current-password').value = '';
         document.getElementById('new-password').value = '';
+    };
+
+    // Search modal
+    const searchModal = document.getElementById('search-modal');
+    const searchInput = document.getElementById('search-input');
+    const searchResults = document.getElementById('search-results');
+    document.getElementById('btn-search').onclick = () => {
+        searchModal.classList.add('show');
+        searchInput.value = '';
+        searchResults.innerHTML = '';
+        searchInput.focus();
+    };
+    document.getElementById('btn-search-close').onclick = () => searchModal.classList.remove('show');
+    searchInput.oninput = async () => {
+        const q = searchInput.value.trim();
+        if (!q) { searchResults.innerHTML = ''; return; }
+        const res = await api('search', { q });
+        const data = await res.json();
+        searchResults.innerHTML = '';
+        data.forEach(doc => {
+            const el = document.createElement('div');
+            el.className = 'link-item';
+            el.textContent = doc.title;
+            el.onclick = () => { searchModal.classList.remove('show'); selectDoc(doc.id); };
+            searchResults.appendChild(el);
+        });
+    };
+
+    // Export modal
+    const exportModal = document.getElementById('export-modal');
+    document.getElementById('btn-export').onclick = () => exportModal.classList.add('show');
+    document.getElementById('btn-export-close').onclick = () => exportModal.classList.remove('show');
+    document.getElementById('btn-export-do').onclick = async () => {
+        const format = document.getElementById('export-format').value;
+        const res = await api('export', { doc_id: currentDocId, format });
+        const data = await res.json();
+        const blob = new Blob([data.content], { type: format === 'markdown' ? 'text/markdown' : 'text/html' });
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = `${data.title}.${format === 'markdown' ? 'md' : 'html'}`;
+        a.click();
+    };
+
+    // Import modal
+    const importModal = document.getElementById('import-modal');
+    document.getElementById('btn-import').onclick = () => importModal.classList.add('show');
+    document.getElementById('btn-import-cancel').onclick = () => importModal.classList.remove('show');
+    document.getElementById('btn-import-do').onclick = async () => {
+        if (!canEdit) return alert('Lecture seule');
+        const format = document.getElementById('import-format').value;
+        const content = document.getElementById('import-content').value;
+        const res = await api('import', { doc_id: currentDocId, format, content });
+        const data = await res.json();
+        if (data.error) { alert(data.error); return; }
+        importModal.classList.remove('show');
+        document.getElementById('import-content').value = '';
+        refresh();
+    };
+
+    // History modal
+    const historyModal = document.getElementById('history-modal');
+    const historyList = document.getElementById('history-list');
+    document.getElementById('btn-history').onclick = async () => {
+        historyModal.classList.add('show');
+        await loadHistory();
+    };
+    document.getElementById('btn-history-close').onclick = () => historyModal.classList.remove('show');
+    async function loadHistory() {
+        const res = await api('versions_list', { doc_id: currentDocId });
+        const data = await res.json();
+        historyList.innerHTML = '';
+        data.forEach(v => {
+            const el = document.createElement('div');
+            el.className = 'link-item';
+            el.textContent = `${v.created_at} · ${v.username} · bloc ${v.block_id}`;
+            el.onclick = async () => {
+                if (!canEdit) return;
+                if (!confirm('Restaurer cette version ?')) return;
+                const res = await api('versions_restore', { version_id: v.id });
+                const resp = await res.json();
+                if (resp.error) { alert(resp.error); return; }
+                historyModal.classList.remove('show');
+                refresh();
+            };
+            historyList.appendChild(el);
+        });
+    }
+
+    // Comments modal
+    const commentsModal = document.getElementById('comments-modal');
+    const commentsList = document.getElementById('comments-list');
+    let currentCommentBlock = null;
+    window.openComments = async (blockId) => {
+        currentCommentBlock = blockId;
+        commentsModal.classList.add('show');
+        await loadComments();
+    };
+    document.getElementById('btn-comments-close').onclick = () => commentsModal.classList.remove('show');
+    document.getElementById('btn-comment-add').onclick = async () => {
+        const comment = document.getElementById('comment-input').value.trim();
+        if (!comment) return;
+        await api('comments_add', { doc_id: currentDocId, block_id: currentCommentBlock, comment });
+        document.getElementById('comment-input').value = '';
+        await loadComments();
+    };
+    async function loadComments() {
+        if (!currentCommentBlock) return;
+        const res = await api('comments_list', { doc_id: currentDocId, block_id: currentCommentBlock });
+        const data = await res.json();
+        commentsList.innerHTML = '';
+        data.forEach(c => {
+            const el = document.createElement('div');
+            el.className = 'link-item';
+            const header = document.createElement('div');
+            header.innerHTML = `<strong>${c.username}</strong> · ${c.created_at}`;
+            const body = document.createElement('div');
+            body.style.marginTop = '4px';
+            body.textContent = c.comment;
+            el.appendChild(header);
+            el.appendChild(body);
+            if (isAdmin || c.user_id === userId) {
+                const del = document.createElement('button');
+                del.className = 'btn-secondary';
+                del.textContent = 'Suppr';
+                del.onclick = async () => { await api('comments_delete', { id: c.id }); await loadComments(); };
+                el.appendChild(del);
+            }
+            commentsList.appendChild(el);
+        });
+    }
+
+    // Files modal
+    const filesModal = document.getElementById('files-modal');
+    const filesList = document.getElementById('files-list');
+    const fileInput = document.getElementById('file-upload');
+    const openFilesModal = async () => {
+        filesModal.classList.add('show');
+        await loadFiles();
+    };
+    window.openFilesModal = openFilesModal;
+    document.getElementById('btn-files').onclick = openFilesModal;
+    document.getElementById('btn-files-close').onclick = () => filesModal.classList.remove('show');
+    fileInput.onchange = async () => {
+        if (!canEdit) return alert('Lecture seule');
+        const file = fileInput.files[0];
+        if (!file) return;
+        const form = new FormData();
+        form.append('file', file);
+        form.append('doc_id', currentDocId);
+        const res = await fetch(`?action=files_upload`, {
+            method: 'POST',
+            headers: { 'X-CSRF-Token': csrfToken },
+            body: form
+        });
+        const data = await res.json();
+        if (data.error) { alert(data.error); return; }
+        await loadFiles();
+        await api('add', { type: 'file', content: JSON.stringify({ name: data.name, url: data.url }), doc_id: currentDocId });
+        refresh();
+        fileInput.value = '';
+    };
+
+    async function loadFiles() {
+        const res = await api('files_list', { doc_id: currentDocId });
+        const data = await res.json();
+        filesList.innerHTML = '';
+        data.forEach(f => {
+            const el = document.createElement('div');
+            el.className = 'link-item';
+            el.innerHTML = `<a href="${f.url}" target="_blank" rel="noopener">${f.original_name}</a>`;
+            if (canEdit) {
+                const del = document.createElement('button');
+                del.className = 'btn-secondary';
+                del.textContent = 'Suppr';
+                del.onclick = async () => { await api('files_delete', { id: f.id }); await loadFiles(); };
+                el.appendChild(del);
+            }
+            filesList.appendChild(el);
+        });
+    }
+
+    // Theme toggle
+    const themeKey = 'collabTheme';
+    const applyTheme = (theme) => {
+        document.documentElement.dataset.theme = theme;
+        localStorage.setItem(themeKey, theme);
+    };
+    applyTheme(localStorage.getItem(themeKey) || 'light');
+    document.getElementById('btn-theme').onclick = () => {
+        const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+        applyTheme(next);
     };
 
     // Forced credentials change
@@ -1506,6 +2097,14 @@ if (!$currentUser) {
         if (mustChange) {
             document.getElementById('force-credentials-modal').classList.add('show');
         }
+
+        const updateOnlineStatus = () => {
+            offlineBadge.style.display = navigator.onLine ? 'none' : 'inline-flex';
+            if (navigator.onLine) flushQueue();
+        };
+        window.addEventListener('online', updateOnlineStatus);
+        window.addEventListener('offline', updateOnlineStatus);
+        updateOnlineStatus();
     });
 
     async function refresh() {
@@ -1623,6 +2222,7 @@ if (!$currentUser) {
         div.innerHTML = `
             <div class="block-controls">
                 <i class="fa-solid fa-grip-vertical icon-btn drag-handle"></i>
+                <i class="fa-regular fa-comment-dots icon-btn" onclick="openComments(${block.id})"></i>
                 <i class="fa-solid fa-trash icon-btn icon-trash" onclick="deleteBlock(${block.id})"></i>
             </div>
             <div class="block-content"></div>
@@ -1682,6 +2282,15 @@ if (!$currentUser) {
             const finalId = vid.includes('v=') ? vid.split('v=')[1].split('&')[0] : vid;
             if (finalId && finalId !== block.content) save(block.id, finalId);
             contentDiv.innerHTML = `<iframe width="100%" height="400" src="https://www.youtube.com/embed/${finalId}" frameborder="0" allowfullscreen></iframe>`;
+        }
+        else if (block.type === 'file') {
+            const f = JSON.parse(block.content || '{}');
+            const name = f.name || 'Fichier';
+            const url = f.url || '#';
+            contentDiv.innerHTML = `<div style="padding:8px 12px;border:1px solid #e5e7eb;border-radius:8px;display:flex;align-items:center;gap:8px;">
+                <i class="fa-regular fa-file"></i>
+                <a href="${url}" target="_blank" rel="noopener">${name}</a>
+            </div>`;
         }
     }
 
@@ -1745,6 +2354,15 @@ if (!$currentUser) {
             el.querySelector('.todo-check').checked = d.checked;
             el.querySelector('.todo-input').value = d.text;
             el.querySelector('.todo-input').classList.toggle('todo-done', d.checked);
+        }
+        else if (block.type === 'file') {
+            const f = JSON.parse(block.content || '{}');
+            const name = f.name || 'Fichier';
+            const url = f.url || '#';
+            el.querySelector('.block-content').innerHTML = `<div style="padding:8px 12px;border:1px solid #e5e7eb;border-radius:8px;display:flex;align-items:center;gap:8px;">
+                <i class="fa-regular fa-file"></i>
+                <a href="${url}" target="_blank" rel="noopener">${name}</a>
+            </div>`;
         }
     }
 
