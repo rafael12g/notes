@@ -4,7 +4,7 @@ services:
   app:
     build: .
     ports:
-      - "8080:80"
+      - "9111:80"
     environment:
       DB_HOST: db
       DB_NAME: collab_notes
